@@ -1,86 +1,63 @@
 ---
 title: OpenClaw 的 cron vs heartbeat：两种定时任务怎么选
-feedId: 37426
+feedId: 37438
 source: 综合讨论
 publishedAt: 2026-09-14
 ---
 
 ## 背景
 
-OpenClaw 里有两种"定时"能力，边界经常被搞混：
+OpenClaw 里能让 agent"定时干活"的路径有两条：
 
-- **cron**：由 gateway 内置调度器驱动，按 cron 表达式或固定间隔触发一次任务投递，可以打到主会话，也可以开隔离会话；
-- **heartbeat**：周期性心跳（默认约 30 分钟一次），把 `HEARTBEAT.md` 的内容送进主会话，由 agent 自己判断这一跳要不要干活。
+- **cron**：传统 cron 表达式触发，到点执行一段你写好的 prompt，产物可以投递到指定渠道，有完整的任务清单和执行记录。
+- **heartbeat**：固定间隔的轮询，每次心跳会触发 agent 读一遍 workspace 里的 `HEARTBEAT.md`，由 agent 自己判断"有没有事要做"。没事就回 `HEARTBEAT_OK`，不打扰你。
 
-两者都能实现"定时做事"，但执行模型完全不同，选错机制是社区里最常见的返工原因。
+很多同学两条都用过，但经常选反了，结果要么 token 烧得心疼，要么任务静默失败。
 
 ## 问题
 
-典型错误用法有两类：
+典型误用有两种：
 
-1. **把所有周期任务都塞进 heartbeat**。结果 agent 每半小时在主会话里"认真回答"一遍不需要回答的问题，token 账单很难看。
-2. **用 cron 做条件式巡检**。到点必须投递，哪怕无事发生也跑一轮完整推理，又贵又不优雅。
+1. 把 heartbeat 当 cron 用——"每 5 分钟心跳一次帮我推送日报"。间隔短、耗时久，一天几百次模型调用，而推送时间还不精确（心跳是间隔制，不是定点制）。
+2. 把该用 heartbeat 的场景硬塞进 cron——在 prompt 里写"先检查 A，如果 A 没变就……如果变了再……"。本质上你是在用 prompt 模拟事件监听，脆弱且难维护。
 
-本质区别一句话：**cron 是时间驱动、确定触发；heartbeat 是周期唤醒、条件执行。**
+两者的心智模型不同：**cron 是"时间到 → 执行已写好的动作"，heartbeat 是"到点看一眼 → agent 决定要不要做事"**。
 
-## 做法与步骤
+## 做法
 
-**第一步：给任务分类。**
+**第一步：给任务分类。** 能写成"每周一 9:00 拉取数据并汇总推送"的 → cron；只能写成"帮我盯着 XX，有变化就告诉我"的 → heartbeat。
 
-- 固定时间点、必须准时：日报、定时提醒、收盘后汇总 → cron
-- "每隔一阵看一眼，没事就闭嘴"：盯仓库更新、查设备状态、扫收件箱 → heartbeat
+**第二步：cron 的正确用法。** 用 `openclaw cron add` 定义任务（名称、表达式、prompt、投递方式，具体参数以 `openclaw cron add --help` 为准），`cron list` 看清单，`cron runs` 查历史。注意 prompt 要**自包含**：cron 触发的是一次全新的 agent 会话，别指望它记得上次聊了什么。
 
-**第二步：确定性任务交给 cron。**
-
-```bash
-openclaw cron add --name daily-digest \
-  --cron "0 9 * * *" \
-  --session isolated \
-  --message "汇总昨天的会话要点，输出简报"
-```
-
-隔离会话不占主上下文，产物再通过通知/投递送回主会话。
-
-**第三步：条件巡检交给 heartbeat。** 把检查项写进 `HEARTBEAT.md`，并明确"无操作"规则：
-
-```markdown
-## 检查项
-- 有未处理的 CI 失败吗？有就修复并通知我
-- 关注的仓库有新 release 吗？有就总结变更
-## 规则
-- 全部无事：直接跳过，不要回复
-```
-
-心跳间隔在配置里调（`agents.defaults.heartbeat.every`），先用短周期观察，再放大。
-
-**第四步：混合编排。** 实际项目里两者是配合关系：heartbeat 做轻量巡检，发现异常时 agent 立即行动；cron 负责每天到点必发的汇总，互不抢活。
+**第三步：heartbeat 的正确用法。** 在 workspace 写一份 `HEARTBEAT.md`，内容是短清单（建议 10 行内），把"什么算有事"的判断标准写清楚；用 `every` 控制间隔、`activeHours` 限定活跃时段；无事可做时明确让 agent 返回 `HEARTBEAT_OK`，不产出消息。
 
 ## 踩坑点
 
-- **heartbeat 烧 token 的根因**是 HEARTBEAT.md 里没写"无事跳过"，agent 默认会对每一跳礼貌回复。
-- **cron 隔离会话没有记忆**。需要的上下文（项目路径、上次的状态）必须写进 prompt，别指望它"记得上次"。
-- **时区**：cron 表达式按 gateway 所在机器的时区跑。服务器是 UTC、人在东八区，日报会早到 8 小时。
-- **heartbeat 不保证准点**，间隔只是约数，还有队列延迟；别拿它做"9:00 必须发出"的事。
-- **HEARTBEAT.md 越写越长**，执行会走样。控制在个位数条目，复杂逻辑拆给 cron 或子 agent。
+- **心跳成本**：每次心跳都是一次真实的模型调用，即使最终只回 `HEARTBEAT_OK` 也计 token。间隔设 5 分钟，账单会很诚实。
+- **深夜静默**：heartbeat 默认只在 active hours 内运行，如果你依赖它夜间触发，会"安静地不执行"。夜间任务请交给 cron。
+- **时区**：cron 表达式按 gateway 配置的时区解释，服务器在 UTC 时，"每天 9 点"可能是北京时间 17 点。显式指定时区，别赌默认值。
+- **重复提醒**：同一件事既配了 cron 又写进 `HEARTBEAT.md`，会收到两份通知。一个职责只给一个机制。
+- **清单太长**：整份 `HEARTBEAT.md` 会作为上下文进入每一次心跳，写 50 行等于每次心跳多付 50 行的 token。
+- **心跳不补跑**：gateway 离线期间错过的心跳不会事后补执行。对"一次都不能漏"的任务，用 cron 并定期看执行记录。
 
 ## 可复用建议
 
-- 决策口诀：**到点必做用 cron，见机行事用 heartbeat；"没事别吵我"是 heartbeat 的使用前提。**
-- 成本心算：heartbeat 成本 ≈ 触发频率 × 主会话上下文大小；cron（隔离会话）成本 ≈ 任务 prompt 本身。频率高、上下文大时，优先 cron 隔离会话。
-- 同一件事只配置一处。避免 cron 和 heartbeat 各写一套相似逻辑，之后改需求只改了一半。
-- 上线前先跑一两天，用 `openclaw cron list` / 运行记录和会话日志确认触发频率与实际耗时，再固化周期。
+- 一句话判据：**时间确定用 cron，条件确定用 heartbeat**。
+- `HEARTBEAT.md` 控制在十几行，只放"值得唤醒 agent"的检查项，其余交给 cron 或手动触发。
+- 给每个 heartbeat 配一个日志出口（比如追加到一个状态文件或专用频道），方便复盘它到底实际触发了几次。
+- cron 的 prompt 里写清楚输出格式和投递目标，把它当 API 用，而不是当聊天用。
 
 ## 总结
 
-cron 和 heartbeat 不是替代关系，而是分工关系：cron 管"什么时候必须做"，heartbeat 管"周期性地看有没有该做的"。按**时间确定性**和**是否依赖主会话上下文**两个维度给任务归类，大多数选型困难会自然消失。
+cron 和 heartbeat 不是竞争关系，而是"精确闹钟"与"值班巡检"的分工。把确定性动作交给 cron，把模糊监控交给 heartbeat，同时严格控制心跳频率和清单长度——OpenClaw 的自动化才能既省 token，又不打扰人。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-14/65a13a07e6677137.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-14/4af39986590a5b0f.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-14/06dc76f654cc3151.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-14/3bda64214dfdd961.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-14/c1df98ff3cd954a5.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-14/5563ab14773f3115.png)
 
