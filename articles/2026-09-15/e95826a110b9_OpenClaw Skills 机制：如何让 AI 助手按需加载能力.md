@@ -1,55 +1,81 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 37613
+feedId: 37643
 source: 综合讨论
 publishedAt: 2026-09-15
 ---
 
 ## 背景
 
-Agent 的能力清单越长，上下文越贵。常见的早期做法是把所有工具说明、操作手册全塞进 system prompt，几十个工具挂上来，光"说明书"就吃掉上万 token，模型注意力被稀释，该用的工具反而选不准。Skills 机制的核心思路是把"能力"做成可独立分发的包：平时只在上下文里留一行名字和描述，真正命中时才把完整内容加载进来。
+OpenClaw 的 agent 是常驻进程：接消息渠道、跑定时任务、调各种工具。能力一多，最直接的做法是把所有使用说明都堆进 system prompt——一开始没问题，几周后上下文里躺着几十段"当你需要 X 时应该……"，每轮对话都在为这些大概率用不上的内容付费，模型的工具选择准确率也在下降。
 
-## 问题
+Skills 机制就是为了解决这个问题：把每类能力拆成独立的目录包，运行时按需加载，而不是常驻上下文。
 
-我们在一个内部自动化助手上踩到的三个具体痛点：
+## 核心机制：三层渐进式披露
 
-1. 挂了 40+ 工具后 system prompt 占近万 token，复杂任务的成功率不升反降；
-2. 改一个工具的说明要重发整个 prompt 模板，多人协作互相覆盖，没有版本边界；
-3. 低频能力（比如季度报表生成）一年用不了几次，却常年驻留上下文。
+Skills 的设计核心是 progressive disclosure，理解这三层，其余都是细节：
 
-## 做法
+1. **第一层（常驻）**：会话启动时，只有每个 skill 的 name 和 description 被注入上下文，单个 skill 占用几十 token。
+2. **第二层（按需）**：任务匹配某个 skill 的 description 时，agent 才读入该 skill 的 SKILL.md 正文。
+3. **第三层（更深的按需）**：SKILL.md 引用的 references/ 文档、scripts/ 脚本只在真正用到时才读取——脚本甚至是执行而非读入，基本不占上下文。
 
-按三步搭起来：
+这个分层决定了写 skill 的优化方向：description 决定触不触发，SKILL.md 决定执行质量，脚本决定成本。
 
-1. **建目录**：每个 skill 一个文件夹，`SKILL.md` 用 frontmatter 写 `name` 和 `description`，正文写操作步骤，重逻辑放同目录的脚本里。
-2. **写触发描述**：description 是常驻上下文的唯一内容，用"当需要……时使用"的句式写清触发条件，而不是堆形容词。
-3. **渐进式加载**：正文里用路径引用脚本和资源文件。agent 命中 skill 后先读正文，确认需要才去执行脚本——第三层内容不命中就不进上下文。
+## 实操步骤
+
+**1. 建目录结构**
+
+```
+~/.openclaw/skills/pdf-report/
+├── SKILL.md
+├── scripts/
+│   └── render.py
+└── references/
+    └── style-guide.md
+```
+
+**2. 写 frontmatter，重点是 description**
+
+description 不是"这是什么"，而是"什么时候用"。写成 `Use when the user asks to generate weekly PDF reports from Markdown files.` 这类句式，给模型一个明确的触发条件。
+
+**3. 正文保持精简**
+
+SKILL.md 只写操作流程：步骤、边界情况、该跑哪个脚本。超过几百行就该拆——参考手册、参数表、示例统统下沉到 references/，正文里留一行"详见 references/xxx"即可。
+
+**4. 能脚本化的都脚本化**
+
+模型读 300 行脚本要花 token，跑 `python render.py --input xx.md` 只要一行。确定性逻辑放脚本里，SKILL.md 只负责告诉 agent 怎么调用。
+
+**5. 真实任务验证**
+
+改完 skill 用 3~5 个真实场景的 prompt 测试：该触发的有没有触发，不该触发的有没有误伤。
 
 ## 踩坑点
 
-- **description 太泛**：类似"数据处理助手"这种描述，要么永远不命中，要么被滥用。建议用"具体动作 + 对象 + 场景"来写。
-- **正文太重**：把所有细节都写进 SKILL.md，一命中就灌几千 token，等于换了个地方膨胀。正文控制在 500 字内，细节下沉到脚本。
-- **边界重叠**：多个 skill 覆盖面交叉，agent 挑错。我们的办法是给每个 skill 配对抗性测试 prompt，专门验证边界 case。
-- **依赖未声明**：脚本依赖没写清，运行时才报错。在正文开头固定一段依赖声明。
+- **description 含糊**：写"处理文档相关任务"这种描述，模型要么不触发要么乱触发。触发条件要具体到动词和对象。
+- **SKILL.md 写成百科**：第二层一加载就顶掉正事。SKILL.md 是操作手册，不是知识库。
+- **脚本依赖没声明**：skill 依赖 Python 3.10+ 或某个包却没写清楚，生产环境第一次跑就报错。在 SKILL.md 开头写明依赖和安装方式。
+- **与 MCP 工具职责重叠**：MCP 管的是"连接外部服务"，skill 管的是"流程和领域知识"。两者重叠时模型选择会摇摆，规划时先划清边界。
+- **skill 目录不进版本管理**：skills 是代码的一部分，进 git，改动可回滚、可审查。
 
 ## 可复用建议
 
-- 一个 skill 只做一件事，按任务切边界，不按 API 切；
-- 定期审计 skill 索引的总 token 成本，超过常驻上下文的 5% 就该合并或裁剪；
-- 能给脚本的不给散文——agent 执行比记忆更可靠；
-- 把 description 当检索 query 优化，用你预期用户实际会说的话来写。
+- 一个 skill 只解决一类问题，宁可多个小 skill，不要一个大杂烩
+- 把 SKILL.md 当成"给新同事的入职文档"来写：假设读者聪明但不了解你的业务
+- 脚本做到幂等、支持 dry-run，方便排查
+- 定期回顾 description：agent 的实际使用记录会告诉你触发边界准不准
 
 ## 总结
 
-Skills 本质是"检索 + 渐进披露"在 agent 工具层的落地：让助手从"全都知道"变成"知道去哪查"。它不提升模型能力，但显著降低上下文成本和维护成本。我们迁移完成后，常驻上下文从 9k token 降到 1.2k，工具选择准确率反而回升。如果你也在被不断膨胀的 prompt 折磨，值得花一个下午把现有工具拆成 skills——拆的过程本身，就是一次对系统能力边界的重新梳理。
+Skills 机制本质上是上下文经济学：描述常驻、正文按需、脚本执行，让每一份 token 花在真正需要的环节。对实践者来说，投入产出比最高的一步是把每个 description 打磨成清晰的触发条件——这一步做好了，后面的整条加载链路才会顺畅。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/02a2f365b7b2318e.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/bbae90e1f81b3867.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/a493b20dafdb6b49.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/fcb4bb22059fe8ac.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/2fd39493dca815a3.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/863b36128f568969.png)
 
