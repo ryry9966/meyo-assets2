@@ -1,72 +1,69 @@
 ---
 title: Markdown 管线：从 AI 生成到多平台发布的格式适配
-feedId: 37600
+feedId: 37658
 source: 综合讨论
 publishedAt: 2026-09-15
 ---
 
 ## 背景
 
-用 Agent 产出技术内容已是常态：模型输出的天然格式就是 Markdown，OpenClaw 的 skill/MCP 工具链也容易把「生成→审校→发布」串起来。真正麻烦的是最后一公里——同一篇 Markdown 要同时发到公众号、知乎、掘金、GitHub 或自建站点，各平台格式支持差异很大，手工逐平台粘贴调样式既耗时又容易出错。下面记录我们跑通的一条发布管线，思路是「规范化一次，逐目标适配」。
+自从把写作流程交给 Agent 辅助后，我发现生成内容只占工作量的三成，剩下七成在"把它变成各平台能直接发的样子"。同一篇 Markdown，博客要 frontmatter，公众号要内联样式的 HTML，知乎吃一半不吃一半。手动复制粘贴改格式，一周下来纯浪费。于是把这条链路做成了管线，分享一下设计思路。
 
-## 问题
+## 问题拆解
 
-把 AI 原文直接丢给各平台，通常撞上三类问题：
+实际跑下来，问题集中在三类：
 
-1. **能力子集不同**。公众号不接受原生 Markdown，只吃内联样式的 HTML；知乎对表格、脚注、任务列表支持有限；GFM 语法糖（`==高亮==`、折叠块）在多数平台会原样露出符号。
-2. **资源引用不稳**。图片外链被部分平台防盗链拦截，公式在 KaTeX / MathJax / 图片之间没有统一方案。
-3. **自动化缺乏幂等性**。重跑产生重复文章，更新没有入口，Agent 无法判断「这篇发过没有、发到哪了」。
+1. **AI 输出不稳定**：同一个 prompt，模型今天给 frontmatter 明天不给；代码块语言标注时有时无；偶尔在正文里混 HTML 标签。
+2. **平台格式差异大**：公众号不认 Markdown，表格会溢出，外链会被吞成纯文本；知乎的表格和代码块渲染与 GFM 有出入；掘金要求 YAML frontmatter 声明分类。
+3. **资产处理麻烦**：图片外链在微信里经常因防盗链挂掉，代码高亮需要内联 style 而不是 CSS class。
 
-## 做法
+## 管线设计
 
-### 第一步：收敛到规范子集
+核心思路：**一份规范化中间格式，多个平台 adapter**。
 
-在 prompt 层和 lint 层双重约束输出：只用标准 GFM，禁用裸 HTML、脚注、TOC，公式统一 KaTeX 语法并保留降级方案。用 remark-lint 写几条自定义规则跑在 CI 里，超集内容直接打回重生成。规范子集文档与 prompt 放同一目录维护，保证两者不漂移。
+### 第一步：规范化（normalize）
 
-### 第二步：转换层用 unified 生态
+约定一份 canonical Markdown：固定 frontmatter 字段（title/date/tags/目标平台列表）、纯 GFM、图片一律本地相对路径。AI 生成后先过 remark-lint 校验，不符合就打回让 Agent 修，或脚本自动修（补全代码块语言标注、统一列表符号等）。
 
-核心链路是 remark（mdast）→ rehype（hast）→ 各平台渲染器：
+这一层的关键是别相信模型。prompt 里写清输出约定只是第一道防线，lint 是第二道，缺一不可。
 
-- 公众号：md → HTML → 用 juice 全量内联 CSS → 写剪贴板或浏览器自动化粘贴；
-- 支持 Markdown 的平台（GitHub、掘金）：保留 front-matter，走 API 提交；
-- 不支持表格/高亮的平台：代码块预高亮成带色 span，宽表格降级为列表。
+### 第二步：平台适配（transform）
 
-每个转换器都是纯函数 `md → platform payload`，用快照测试锁行为。
+每个平台一个 adapter，基于 remark/rehype 的 AST 做转换。公众号 adapter 负责：Markdown 转 HTML、用 highlight.js 在构建期把高亮烧成内联 style、表格包一层固定宽度容器、把外链收集起来挪到文末"参考链接"。知乎和掘金的 adapter 简单得多，主要是裁剪 frontmatter 和替换图片路径。
 
-### 第三步：图片先行
+### 第三步：资产处理（assets）
 
-发布前统一把图片下载到中转存储，按目标平台决定重传还是替换为稳定外链。链接重写在 rehype 阶段集中完成，不在各渲染器里散落处理。
+发布前统一处理图片：下载到本地、按平台压缩到规定尺寸、调平台上传接口换回平台 URL 并替换正文引用。公众号没有开放的内容发布 API，这一段用浏览器自动化兜底；其他平台尽量走 API。
 
-### 第四步：交给 Agent 编排
+### 第四步：发布（publish）
 
-把管线封装成一个 MCP 工具：输入 markdown 文件 + 目标平台列表，逐平台转换、dry-run 预览，确认后发布并返回各目标 URL。发布成功后把「源文件内容哈希 → 平台 URL」写入本地映射表，重跑时哈希相同就走更新而非新建。
+每个 adapter 输出两种结果：dry-run 产物（最终 HTML/Markdown + 资源清单）和发布动作。先人工过一眼 dry-run，确认再发。发布成功后把平台文章 ID 写回 frontmatter，方便后续更新同步。
 
 ## 踩坑点
 
-- 公众号会剥掉 `<style>` 标签和 class，必须全部内联，`:hover` 之类伪类直接失效；
-- AI 偶尔输出未闭合标签，转换前先 sanitize，否则 rehype 会静默吞掉后半段内容；
-- 忘记剥离 front-matter，非 Jekyll 平台会把 `---` 渲染成分隔线；
-- 代码块语言标注在部分平台被丢弃，要么接受降级，要么预高亮；
-- 微信图片域名防盗链，`<img>` 引用外部图时务必清缓存实测。
+- **高亮时机**：一开始用 CSS class 输出 HTML，贴进公众号全丢。必须在构建期内联化。
+- **表格溢出**：公众号编辑器会把宽表格截断，转 HTML 时包固定宽度容器允许横向滚动，或直接降级为列表。
+- **外链静默失败**：公众号把 `<a>` 渲染成纯文本且不报错，adapter 里要主动检测并重排到文末，别指望肉眼发现。
+- **AI 混入 HTML**：模型偶尔在 Markdown 里塞 `<div>`，remark 处理 HTML 节点很别扭。normalize 阶段直接拒绝块级 HTML 输入，打回重生成。
+- **图片上传幂等性**：重复发布容易二次上传，用内容 hash 做本地缓存，同图不重复传。
 
 ## 可复用建议
 
-1. **每个平台一份格式 profile（YAML）**，声明支持/禁用语法与渲染策略，管线读配置而非硬编码；
-2. **强制 dry-run**：发布动作先产出预览产物（HTML/截图），复核后再落库；
-3. **哈希幂等**：以内容哈希为幂等键，更新与新建分离；
-4. **规范子集是合同**：prompt、lint、转换器三方对齐同一份文档。
+- 把 normalize / render / publish 拆成独立的 MCP tools，由 Agent 编排调用，人只在 publish 前过目。dry-run 输出统一 diff 格式，review 成本很低。
+- 每个 adapter 配 golden file 测试：固定输入 Markdown，比对输出快照，平台改版时一跑就知道哪里坏了。
+- canonical 格式宁窄勿宽：限制越少，adapter 越难写。
 
 ## 总结
 
-这条管线的关键不是某个转换库，而是分层：上层 Agent 做生成与编排，中间确定性代码做收敛与转换，底层用配置描述平台差异。AI 管内容，管线管格式，边界清晰后，新增一个发布目标通常只是加一份 profile 和一个纯函数渲染器。
+管线跑通后，一篇文章从生成到三平台发布的边际成本降到几分钟，格式事故基本消失。经验浓缩成一句：**把"格式正确"当作管线的 invariant 来验收，而不是发布前的人工检查项**。AI 负责内容，管线负责确定性，各干各的。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/1828fee1289701d0.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/5f89fb83c384d589.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/beab46f9485c005f.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/0c2db5e00602ae7a.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/d8b930b980371a42.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/8e69a0ad9d8ba917.png)
 
