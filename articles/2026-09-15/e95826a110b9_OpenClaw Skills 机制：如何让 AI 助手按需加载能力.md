@@ -1,81 +1,79 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 37643
+feedId: 37683
 source: 综合讨论
 publishedAt: 2026-09-15
 ---
 
-## 背景
+## 背景：能力清单 vs 上下文预算
 
-OpenClaw 的 agent 是常驻进程：接消息渠道、跑定时任务、调各种工具。能力一多，最直接的做法是把所有使用说明都堆进 system prompt——一开始没问题，几周后上下文里躺着几十段"当你需要 X 时应该……"，每轮对话都在为这些大概率用不上的内容付费，模型的工具选择准确率也在下降。
+Agent 的能力规模和上下文预算是一对矛盾。功能少，助手鸡肋；把所有操作文档塞进 system prompt，token 消耗高，还会稀释注意力——模型在一堆用不上的指令里挑重点，命中率反而下降。
 
-Skills 机制就是为了解决这个问题：把每类能力拆成独立的目录包，运行时按需加载，而不是常驻上下文。
+OpenClaw 的 Skills 机制就是针对这个问题：能力以独立目录（skill）存放，常驻上下文的只有一行「名字 + 描述」，正文按需加载。官方说法是 progressive disclosure，工程上理解成惰性加载即可。它和 MCP 是互补关系：MCP 扩展可调用的接口，skill 扩展的是模型「怎么做事」的操作知识。
 
-## 核心机制：三层渐进式披露
+## 机制拆解
 
-Skills 的设计核心是 progressive disclosure，理解这三层，其余都是细节：
+加载分两段：
 
-1. **第一层（常驻）**：会话启动时，只有每个 skill 的 name 和 description 被注入上下文，单个 skill 占用几十 token。
-2. **第二层（按需）**：任务匹配某个 skill 的 description 时，agent 才读入该 skill 的 SKILL.md 正文。
-3. **第三层（更深的按需）**：SKILL.md 引用的 references/ 文档、scripts/ 脚本只在真正用到时才读取——脚本甚至是执行而非读入，基本不占上下文。
+1. **元数据阶段**：会话建立时，网关扫描所有可用 skill，把 `name` 和 `description` 注入 system prompt，每个 skill 只占几十 token。
+2. **触发阶段**：用户请求匹配某条描述时，agent 自主调用 read 读取对应 `SKILL.md` 全文，再按其中步骤执行。
 
-这个分层决定了写 skill 的优化方向：description 决定触不触发，SKILL.md 决定执行质量，脚本决定成本。
+关键在于第二步是模型自己决策的，所以 description 的质量直接决定命中率。
 
 ## 实操步骤
 
-**1. 建目录结构**
+以一个「整理截图并归档」的 skill 为例：
 
+1. 在工作区建目录：`<workspace>/skills/screenshot-organizer/`；
+2. 写 `SKILL.md`，frontmatter 至少包含：
+
+```yaml
+---
+name: screenshot-organizer
+description: 当用户要求整理、重命名或归档屏幕截图时使用。触发词：截图、桌面太乱、归档图片。
+---
 ```
-~/.openclaw/skills/pdf-report/
-├── SKILL.md
-├── scripts/
-│   └── render.py
-└── references/
-    └── style-guide.md
+
+3. 正文写具体步骤：扫描哪个目录、按什么规则重命名、调用哪个脚本、失败时如何兜底；
+4. 重开会话，用 `openclaw skills list` 确认已识别，再用自然语言触发一次，观察 agent 是否先读了 SKILL.md；
+5. 有环境依赖就加门控：
+
+```yaml
+metadata:
+  requires:
+    bins: [imagemagick]
 ```
 
-**2. 写 frontmatter，重点是 description**
+二进制缺失时 skill 会被标记为不可用，agent 不会盲目调用然后报错。
 
-description 不是"这是什么"，而是"什么时候用"。写成 `Use when the user asks to generate weekly PDF reports from Markdown files.` 这类句式，给模型一个明确的触发条件。
+## 踩坑记录
 
-**3. 正文保持精简**
-
-SKILL.md 只写操作流程：步骤、边界情况、该跑哪个脚本。超过几百行就该拆——参考手册、参数表、示例统统下沉到 references/，正文里留一行"详见 references/xxx"即可。
-
-**4. 能脚本化的都脚本化**
-
-模型读 300 行脚本要花 token，跑 `python render.py --input xx.md` 只要一行。确定性逻辑放脚本里，SKILL.md 只负责告诉 agent 怎么调用。
-
-**5. 真实任务验证**
-
-改完 skill 用 3~5 个真实场景的 prompt 测试：该触发的有没有触发，不该触发的有没有误伤。
-
-## 踩坑点
-
-- **description 含糊**：写"处理文档相关任务"这种描述，模型要么不触发要么乱触发。触发条件要具体到动词和对象。
-- **SKILL.md 写成百科**：第二层一加载就顶掉正事。SKILL.md 是操作手册，不是知识库。
-- **脚本依赖没声明**：skill 依赖 Python 3.10+ 或某个包却没写清楚，生产环境第一次跑就报错。在 SKILL.md 开头写明依赖和安装方式。
-- **与 MCP 工具职责重叠**：MCP 管的是"连接外部服务"，skill 管的是"流程和领域知识"。两者重叠时模型选择会摇摆，规划时先划清边界。
-- **skill 目录不进版本管理**：skills 是代码的一部分，进 git，改动可回滚、可审查。
+- **description 写成功能说明书**。「本技能可以处理图片」这种写法基本不会命中。要写触发场景：「当用户说桌面截图太乱、要求按日期归档时使用」。
+- **SKILL.md 太长**。超过两三百行，一次读入就是上下文冲击。把重操作拆成脚本文件放在 skill 目录里，正文只写调用方式和边界条件。
+- **frontmatter 格式错误**。缩进或冒号写错，skill 会静默失效。排查第一步永远是跑 `skills list` 看它还在不在。
+- **多处同名**。bundled、managed、workspace 都能放 skill，同名时按优先级覆盖。改了文件没生效，先用 list 确认实际加载的是哪一份。
+- **长会话缓存**。SKILL.md 被读过之后，本次会话内通常不会重读。改完内容请开新会话验证，别在旧会话里反复调。
+- **漏写 requires**。依赖 CLI 工具却不声明，agent 会在缺工具的环境里硬调，白费一轮交互。
 
 ## 可复用建议
 
-- 一个 skill 只解决一类问题，宁可多个小 skill，不要一个大杂烩
-- 把 SKILL.md 当成"给新同事的入职文档"来写：假设读者聪明但不了解你的业务
-- 脚本做到幂等、支持 dry-run，方便排查
-- 定期回顾 description：agent 的实际使用记录会告诉你触发边界准不准
+- description 套模板：「当用户要做 X / 提到 Y 时使用。触发词：A、B。」
+- 每个 skill 只做一件事，正文控制在一两百行，超了就拆子流程；
+- 脚本和模板放进 skill 目录，正文用相对路径引用，方便整目录迁移、分享；
+- 新 skill 上线前用干净会话测三类输入：标准触发、近义改写、无关请求（确认不误触发）；
+- 高频操作沉淀成 skill，比往 AGENTS.md 里堆规则更省上下文。
 
 ## 总结
 
-Skills 机制本质上是上下文经济学：描述常驻、正文按需、脚本执行，让每一份 token 花在真正需要的环节。对实践者来说，投入产出比最高的一步是把每个 description 打磨成清晰的触发条件——这一步做好了，后面的整条加载链路才会顺畅。
+Skills 机制的本质是上下文经济学：把「知道自己会什么」（常驻、极小）和「具体怎么做」（按需、完整）拆开。写好一个 skill 的成本不在代码，而在 description 的触发设计和正文的克制程度。清单化、小步验证，这套机制就能稳定吃进日常自动化流程里。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/bbae90e1f81b3867.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/43c5b8edde2f41b0.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/fcb4bb22059fe8ac.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/7162adb2c471923f.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/863b36128f568969.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-15/2cf57481a3102920.png)
 
