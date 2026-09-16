@@ -1,71 +1,80 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 37833
+feedId: 37834
 source: 综合讨论
 publishedAt: 2026-09-16
 ---
 
 ## 背景
 
-用 OpenClaw 一段时间后，能力来源会越积越多：几个 MCP 服务器、一批 CLI 工具、自己写的自动化脚本。最初的直觉是把所有说明和流程都写进系统提示词或 `AGENTS.md`，结果上下文被大量与当前任务无关的内容占满——token 费用上去了，模型选工具反而更容易选错。
+跑 Agent 时间长了，最直观的感受是上下文越来越贵，也越来越“脏”。早期我把所有指令、工具说明、业务规则全塞进 system prompt，工具列表拉到几十个。结果是 token 成本上去了，模型选错工具的频率也上去了——可选项太多，注意力被稀释。
 
-Skills 机制就是针对这个问题的：**能力不常驻，按需加载**。
+Skills 机制就是为解决这件事：把能力拆成独立模块，平时只暴露元信息，命中时才加载正文，资源文件按需读取。核心思路是渐进式披露（progressive disclosure）。
 
-## 原理：三层渐进式披露
+## 问题具体是什么
 
-每个 Skill 是一个目录，核心是一个 `SKILL.md`：
+1. 全量注入的 prompt 里九成内容与当前任务无关，模型容易被无关规则带偏；
+2. 工具列表过长，函数调用准确率明显下降；
+3. 多个项目共享同一助手时，能力无法按项目裁剪，复制 prompt 维护成本高。
 
-```markdown
----
-name: video-subtitle-cleanup
-description: 清理 SRT 字幕文件中的时间轴错位和重复行。Use when user 提到字幕、srt、时间轴对齐。
----
-（正文：具体操作步骤、命令、注意事项）
+## 做法
+
+一个 Skill 就是一个目录，最少只需要一个 SKILL.md：
+
+```text
+skills/
+  weekly-report/
+    SKILL.md          # frontmatter + 指令正文
+    scripts/
+      fetch_data.py   # 可选：确定性逻辑写成脚本
+    references/
+      template.md     # 可选：按需读取的资源
 ```
 
-加载分三层：
+frontmatter 只有 `name` 和 `description` 两个字段，而 description 是触发判定的唯一依据：
 
-1. **常驻层**：只有 `name` + `description` 进入上下文，单个成本在几百字节级别；
-2. **正文层**：模型判断当前任务匹配某条 description 时，才读取完整 `SKILL.md`；
-3. **附件层**：正文里引用的脚本、参考文件，真正用到时才打开。
+```yaml
+---
+name: weekly-report
+description: 生成团队周报时使用。当用户要求汇总本周工作、整理进度或撰写周报时触发。
+---
+正文写操作步骤、约束和示例输出……
+```
 
-这样装 30 个 Skill，平时上下文里只有一份目录索引。
+三层加载逻辑：
 
-## 实操步骤
+- 启动时只读入所有 skill 的 name + description（每条几十 token）；
+- 用户请求命中描述时，加载该 skill 完整正文；
+- 正文里以路径引用的资源（模板、脚本），执行到才读取。
 
-1. 在工作区 `skills/` 目录（或 `~/.openclaw/skills/`）下建子目录，名字用小写连字符；
-2. 写 `SKILL.md`，frontmatter 至少包含 `name` 和 `description`；
-3. 正文只写**操作过程**：流程、命令、边界情况，不写背景故事；
-4. 大段参考内容（长命令表、配置样例）拆成独立文件，正文里用相对路径引用；
-5. 用 `openclaw skills list` 确认可见，然后实测：问一个应该触发它的问题，观察是否加载。不触发，回去改 description。
+与 MCP 的分工：MCP 提供工具接口（“能调用什么”），Skills 提供操作知识（“该怎么用、什么流程”）。两者叠加，不是二选一。
 
 ## 踩坑点
 
-- **description 写给人看，不是写给模型看**。要包含触发条件和关键词，"Use when…" 句式比形容词有用得多。这是最常见的失效原因：skill 永远不被触发。
-- **description 太宽泛**，比如"处理文件"，会导致几乎每个任务都加载它，等于没做按需。
-- **把所有东西塞进正文**，本质上只是把 system prompt 挪了个地方，没省任何预算。
-- **与内置 Skill 职责重叠**，模型面临两个相似候选时路由会变得不稳定。先查重再命名。
-- **只装不清理**。Skill 的 description 常驻上下文，装 50 个从不审计，成本是隐性的。
+- **description 写不好，skill 等于不存在。** 太模糊（“处理文档”）永远不触发；太宽泛（“帮用户做事”）每次都触发。我的经验是照着用户真实会说的话来写触发条件。
+- **别在正文里堆常驻知识。** 每次都要用的规则放回 prompt；做这件事才需要的才进 skill。
+- **脚本路径写死绝对路径，换机器就挂。** skill 内引用资源一律用相对路径，交给加载器解析。
+- **一个 skill 干多件事会互相污染触发条件。** 拆。
+- **改了没生效，先查加载路径。** 通常是缓存或目录指向问题，别急着改内容。
 
 ## 可复用建议
 
-- 把 description 当作**检索入口**来打磨：写清触发场景、排除场景、关键词；
-- 正文控制在 150–200 行内，更长的内容一律拆附件；
-- Skill 适合承载**过程性知识**（"怎么做 X"），事实性数据（常量、清单）放普通文件更合适；
-- 把 skills 目录纳入 git，改动可回滚，也能看出哪些长期没动过；
-- 定期让助手列出当前可用 skills，删掉一个季度没触发过的。
+- 描述公式：做什么 + 什么时候用，嵌入 2~3 个用户可能的原话短语；
+- 单一职责，正文控制在 200 行以内，超了就拆，或把细节挪进 references；
+- 确定性步骤（格式转换、数据拉取）写成脚本，让模型只做编排和判断，省 token 且结果稳定；
+- 建一个最小触发测试集，每次改 description 跑一遍，避免上线后“隐身”。
 
 ## 总结
 
-Skills 的价值不在"多"，而在"准"。整个机制可以压缩成一句话：**description 是唯一常驻的成本，所以把路由写清楚；正文是按需的代价，所以把手册写精简**。按这个原则组织能力，工具越多，上下文反而越干净。
+Skills 的价值不在“多了一种插件”，而在把上下文当成预算来管理：常驻的只留索引，细节按需加载。实践下来，同样的任务 token 消耗降了一截，触发准确率反而更高。建议先从你最常重复口述的那类操作入手，抽出一个 skill 跑两周，再决定铺开。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/2174fd0463c67301.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/b21e7d3e542a9cba.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/1cb15597fd68afd4.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/540b15568ef737d7.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/fecd3649dbec2618.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/f6715f7cdfca3d03.png)
 
