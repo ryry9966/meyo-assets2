@@ -1,58 +1,73 @@
 ---
 title: 跨平台消息路由：让一个 Agent 同时服务 Telegram 和 Discord
-feedId: 37755
+feedId: 37858
 source: 综合讨论
 publishedAt: 2026-09-16
 ---
 
 ## 背景
 
-社区用户分散在 Telegram 和 Discord 两个平台。最初的方案是跑两个 Agent 实例，各挂一个 Bot token。短期内能用，但问题很快出现：两边的提示词版本漂移、记忆不共享、改一处配置要人工同步两处。这周把架构收敛成「一个 Agent 核心 + 两个薄适配器」，记录一下过程。
+我们的用户群一半在 Telegram，一半在 Discord。之前维护两个 bot、两套 prompt、两份记忆，同一个问题在两边得到不同答案，运维上也要盯两套告警。这次重构的目标很明确：**Agent 核心只有一份，Telegram 和 Discord 只是两个不同的接入层。**
 
-## 问题
+## 问题拆解
 
-本质上是三类问题：
+真正要解决的其实是四件事：
 
-1. **传输层不同**：Telegram 走 Bot API（长轮询或 webhook），Discord 走 Gateway WebSocket，事件模型完全不同；
-2. **消息格式不同**：Markdown 方言、长度上限（Telegram 4096 / Discord 2000）、转义规则各不相同；
-3. **状态归属**：逻辑会话用什么 key？跨平台身份要不要打通？
+1. **消息模型不一致**：Telegram 的 update 结构和 Discord 的 gateway event 完全不同；
+2. **会话隔离**：两边 chat 的粒度不一样（TG 是 chat_id，DC 还有 channel/thread 两层）；
+3. **输出渲染差异**：双方 markdown 方言不兼容，消息长度限制也不同；
+4. **稳定性**：限流规则、断线重连逻辑各一套。
 
 ## 做法
 
-核心原则：适配器只做协议翻译，所有业务逻辑收进 Agent 核心，工具统一挂在 MCP server 上，保证平台无关。
+架构上只做一层抽象，不过度设计：
 
-1. **定义统一信封**。入站消息归一化为 `{platform, chat_id, user_ref, text, attachments, reply_to}`；出站是规范化结构，渲染交还给适配器。
-2. **写两个薄适配器**。Telegram 用长轮询（内网部署没有公网 HTTPS，省掉 webhook），Discord 用 Gateway，记得在开发者后台打开 Message Content Intent，否则收不到消息正文。
-3. **单点分发**。所有入站消息进同一个队列，按 `platform:chat_id` 做 session key，同一会话串行处理，避免两个平台同时触发导致并发写坏状态。
-4. **出站渲染层单独抽出**：Markdown 转换、按平台上限分片、长输出转文件附件。Telegram 建议直接用 HTML parse mode。
-5. **身份映射选配**。默认不打通跨平台身份（`tg:123` 和 `dc:456` 就是两个用户），有明确需求再引入人工绑定的映射表，不要自动猜测合并。
+**1. 定义 PlatformAdapter 接口**
+
+每个平台实现三个方法：`on_message`（拉消息）、`send`（发消息）、`format`（渲染文本）。核心 Agent 只面向统一消息事件：`platform / chat_id / user_id / text / reply_to / attachments`。
+
+**2. 会话键设计**
+
+`session_key = platform:chat_id`，Discord 下 thread 单独成键（`discord:channel_id:thread_id`）。同一个用户在 TG 和 DC 是两个 session，不做身份打通——没有可靠的映射依据，强行合并只会串数据。
+
+**3. 渲染层降级**
+
+Agent 输出统一的简化 markdown，渲染层按平台转换：TG 走 HTML parse mode（后面说为什么），DC 用原生 markdown。转换不了的结构化内容（比如 DC 的 embed）一律降级为纯文本，宁丑不炸。
+
+**4. 出站队列 + 限速**
+
+所有回复先进队列，按平台各自的限速规则消费。TG 按 chat 维度 1 msg/s，DC 按 webhook/bot 全局桶。长回复自动分段到各自上限以内。
+
+**5. 能力层平台无关**
+
+工具调用全部走 MCP 挂载（检索、DB 查询、定时任务），Adapter 不碰业务逻辑。换平台加功能时只改一处。
 
 ## 踩坑点
 
-- Telegram 的 MarkdownV2 转义是灾难级体验：下划线、星号、方括号等十几个字符都要转义，LLM 输出几乎必炸。换 HTML mode 后基本解决。
-- 分片会劈开代码块。按段落边界切，检测到未闭合的代码围栏就顺延到块结束再切。
-- 两边都有频控：Discord 单频道约 5 条/5 秒，Telegram 单聊天 1 条/秒。出站必须走队列加退避重试，老老实实处理 429。
-- Discord 断线要支持 resume；Telegram `getUpdates` 的 offset 要持久化，否则重启后会重复消费旧消息。
-- Discord 的 mention 格式（尖括号包 user id）跨平台无意义，渲染层直接替换成用户名文本。
+- **Telegram MarkdownV2 转义是地狱**。代码块外的 `_ * [ ]` 全要转义，漏一个就 400。直接切 HTML parse mode，只处理 `<` `>` `&`，问题消失。
+- **Discord 忘开 `message_content` intent**，bot 能上线但收不到正文，排查了半天是 Portal 设置问题。
+- **bot 互相触发死循环**。另一个 bot 的消息也会进来。规则：忽略一切 `from.is_bot = true` 的消息和自己发的消息，没有例外。
+- **消息长度**：TG 上限 4096，DC 2000。不要硬切代码块，按代码块边界切分，否则渲染直接坏掉。
+- **重连后的重复消费**：网关重连会重放事件，用 `message_id` 做幂等键，Redis SETNX 去重即可。
 
 ## 可复用建议
 
-- 适配器保持「笨」：不解析业务语义，不做除重试策略之外的任何决策；
-- 信封结构加版本号字段，后期改 schema 不至于静默坏掉；
-- 每条日志都带 `platform + chat_id`，排障效率差一个数量级；
-- 加一个 dry-run 通道：所有出站先镜像到测试频道，肉眼确认渲染效果再放开。
+1. **先只读跑一周**：新平台先只记录不回复，观察消息分布和异常，再放开写入；
+2. **日志统一带 `platform` 标签**：排障时一条 grep 就能分流两个平台的问题；
+3. **不要做平台特性炫技**：DC 的 slash command、TG 的 inline keyboard 这类强绑定能力，只在你真的需要时做，且必须有无损降级；
+4. **身份映射别硬做**：如果确实要打通用户，让用户主动 bind，不要靠用户名猜。
 
 ## 总结
 
-跨平台路由的关键不是「多接一个 API」，而是把协议差异锁死在适配器里，让 Agent 核心面对一个稳定抽象。收敛之后，改提示词、加工具只动一处，两个平台的用户体验也保持一致。两个适配器加渲染层大概几百行代码，但前期把信封 schema 想清楚，比后面任何优化都重要。
+这次重构的结论一句话：**平台差异全部关在 Adapter 里，核心 Agent 只认统一消息事件。** 总代码量反而比维护两套 bot 少了约四成，新增平台（比如之后的 Slack）理论上只需要再写一个 Adapter。消息路由这件事，难点从来不在“连上”，而在统一模型和边界条件的处理上。欢迎在群里交流你们的接入方案。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/17ef1b28c99cb964.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/9b24c22e2405f027.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/767524121ea618dc.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/5cb6be333e3ea32d.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/eca1f8afa2d240d2.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/ad60fe3e3b639123.png)
 
