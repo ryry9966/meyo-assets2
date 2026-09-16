@@ -1,59 +1,66 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 37793
+feedId: 37805
 source: 综合讨论
 publishedAt: 2026-09-16
 ---
 
 ## 背景
 
-OpenClaw 这类 agent 网关的典型运行形态是：模型拿到工具后直接在本机执行 shell、读写文件。能力越大，翻车半径越大。sandbox 安全模型要回答的核心问题只有一个：**当模型“想错了”，系统靠什么兜底？**
+Agent 之所以有用，是因为它能直接操作系统：跑 shell、读写文件、调用 MCP 工具。但能力即风险。当模型在一次"清理构建产物"的任务里执行了 `rm -rf`，或者把临时目录的路径理解错，损失不是幻觉，而是真实的磁盘数据。
 
-## 问题
+OpenClaw 在设计上做了一个悲观假设：**模型一定会犯错，提示注入一定会发生**。所以它的安全模型不是"让模型更聪明"，而是在模型和宿主机之间垫一层工程边界。
 
-误删很少来自模型“作恶”，更多来自三个经典场景：
+## 问题：事故的真实形态
 
-1. **变量展开失败**：`rm -rf "$TARGET/"` 里 `TARGET` 为空，命令退化成对根路径的操作；
-2. **相对路径歧义**：agent 以为 cwd 在项目目录，实际在用户 home，`rm -rf ./build` 删的是别处的 build；
-3. **软链接逃逸**：workspace 里一个指向 `~/Documents` 的 symlink，让“工作区内删除”删到了工作区外。
+实际跑过 Agent 自动化的人都会遇到这几类故障：
 
-## 做法：四层防线
+1. **路径幻觉**：模型拼出一个不存在的绝对路径，然后"帮"你创建或清理。
+2. **通配符扩散**：`rm ./build/*` 在漂移后的 cwd 下变成灾难。
+3. **提示注入**：仓库里恶意的 README 或 CI 配置诱导 Agent 执行清理命令。
+4. **工具过权**：MCP 文件服务器默认拿到远超任务所需的写权限。
 
-OpenClaw 的思路不是“信任模型”，而是把删除动作拆成多层校验，任何一层拦住都算数。
+这些都是概率问题，靠 prompt 里写一句"请小心操作"解决不了。
 
-**第一层：workspace 边界。** 每个 agent 绑定独立 workspace 根目录，文件工具和默认 exec 的 cwd 都规范化到根目录之下。路径解析在工具层做，不做字符串拼接；symlink 先 resolve 再校验是否越界。
+## OpenClaw 的做法：五层防线
 
-**第二层：exec 沙箱。** shell 命令不直接跑在宿主进程里，而是落在受控运行时——macOS 上走 sandbox profile，Linux 上建议 Docker 容器，只挂载 workspace 和必要的只读目录。宿主 home、系统目录对容器内进程不可见，删无可删。
+**第一层：工作区监狱（workspace jail）。** Agent 进程的可见根被绑定到 workspace 目录，所有文件操作先做 `realpath` 归一化，逃出 workspace 的路径直接拒绝。注意是先 resolve 再判断，而不是字符串前缀匹配——后者会被 symlink 和 `..` 绕过。
 
-**第三层：命令策略。** 工具网关对命令做模式匹配，`rm -rf`、对 `.ssh`、`.git`、配置目录的写入等模式进入 deny 或“需审批”名单。关键是策略在网关层执行，不依赖模型自觉。
+**第二层：挂载粒度控制。** 容器内只挂载任务相关目录，参考数据集、模型缓存一律只读挂载。Agent 看不到 `$HOME`，自然删不了 SSH key。
 
-**第四层：审批门 + 副作用预演。** 高危操作要求人工确认，确认界面展示的是**解析后的绝对路径和受影响文件列表**，而不是原始命令字符串；删除默认先移入 trash 目录，延迟清理。
+**第三层：命令级拦截。** 对 shell 工具做危险模式识别：递归删除、磁盘写入、权限变更类命令进入 deny/confirm 通道，需要用户显式确认才放行。`git clean`、`find -delete` 这类"间接删除"也在模式表里。
+
+**第四层：MCP 工具能力声明。** 每个 MCP server 声明自己需要的能力（`fs.write` / `fs.delete` / `net`），会话启动时按任务模板授权，而不是默认全开。
+
+**第五层：进程与凭证隔离。** sandbox 内无宿主凭证、无 docker socket、默认无外网。即使前四层被击穿，爆炸半径也被限制在一个可丢弃的临时容器里。
 
 ## 踩坑点
 
-- 调试时把 sandbox 关了，忘开回来。建议生产 profile 写死默认值，并定期跑一条“越界删除”冒烟用例验证沙箱确实生效。
-- Docker 图省事直接挂载整个 home，等于没有沙箱。挂载粒度压到 workspace 一级。
-- 只靠 denylist 会被绕过（base64、`find -delete`、一行 python 脚本）。denylist 只做兜底，主防线必须是文件系统边界。
-- symlink 必须在 open/unlink **之前** resolve，事后校验是典型 TOCTOU。
+- **symlink 逃逸**：workspace 里一个指向 `/etc` 的软链就能击穿前缀校验，务必用 resolve 后的真实路径。
+- **cwd 漂移**：Agent 执行 `cd` 之后相对路径语义全变，建议强制所有文件操作使用绝对路径。
+- **确认疲劳**：confirm 弹窗太频繁，用户会习惯性全批。把确认机制只留给真正不可逆的操作。
+- **挂载过宽**：图省事把项目上层目录整个挂进去，隔离形同虚设。
+- **docker socket 泄漏**：挂了 socket 等于交出宿主机 root，比任何误删都危险。
 
 ## 可复用建议
 
-- 每个 agent 独立 workspace，宁可目录多一点，不共享根。
-- 删除 = 移入 trash + 定时清理，成本极低，救回率极高。
-- 审批界面展示绝对路径与文件清单，别让人盯着原始命令做判断。
-- 把“沙箱是否生效”做成 CI 冒烟测试，而不是靠记忆。
+1. 默认只读，按需开写；删除类能力单独授权、单独确认。
+2. 路径校验永远基于 resolve 后的真实路径，不要做字符串匹配。
+3. 危险命令走独立通道，不要用正则白名单硬放行。
+4. 每个自动化任务配独立 workspace，任务结束即销毁。
+5. 定期做破坏性演练：故意让 Agent 尝试越界删除，验证防线是否真的生效。
 
 ## 总结
 
-“Agent 不会误删文件”不是因为模型聪明，而是因为最坏情况下它**够不着**文件。边界在文件系统层、策略在网关层、人在审批层——三层任何一层独立成立，事故就不会发生。这也是我评估任何 agent 框架安全性的第一条：关掉模型的“自觉”，看它还能删什么。
+Agent 不会误删文件，从来不是因为模型足够可靠，而是因为**最坏情况下它够不到那些文件**。OpenClaw 的 sandbox 模型本质是把信任问题转化为边界问题：能力默认最小化、路径先归一化再校验、破坏性操作必须有人的显式参与。模型会犯错，工程边界不该跟着犯错。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/d88d7a3c437ffda1.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/3b9b52d3c126c56f.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/9d9362c61d4c13fa.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/f23f6579e17e1a0e.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/559becd159ce9eb5.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/3f7dfe07654e13cc.png)
 
