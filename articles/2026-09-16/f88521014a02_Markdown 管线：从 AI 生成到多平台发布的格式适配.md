@@ -1,64 +1,61 @@
 ---
 title: Markdown 管线：从 AI 生成到多平台发布的格式适配
-feedId: 37831
+feedId: 37832
 source: 综合讨论
 publishedAt: 2026-09-16
 ---
 
 ## 背景
 
-在 OpenClaw 的自动化流程里，Agent 的产出第一公民就是 Markdown。生成这一步基本不用操心，真正费时间的是下游：同一份 `.md`，要发公众号、掘金、知乎和自己的博客，各平台对 Markdown 的支持参差不齐。手工复制粘贴三遍，格式就开始漂移，图片还得逐个重传。
+Agent 工作流里，LLM 的交付物几乎默认是 Markdown。但真正的下游往往不止一个出口：公众号、掘金、静态博客、RSS 订阅，各平台对 Markdown 的支持差异很大。公众号只认内联样式的 HTML；部分平台不支持脚注、mermaid、复杂表格；图片外链会被防盗链掐断。在社区里看到的实际情况是，格式适配吃掉了发布链路里相当比例的调试时间。
 
 ## 问题
 
-拆开看是三层：
+问题分两层：
 
-1. **AI 产出本身不规范**：标题层级跳级、用加粗当标题、列表缩进空格和 Tab 混用、夹带内联 HTML 残片。
-2. **平台差异**：公众号编辑器会剥掉 `class` 和 `<style>`，只认内联样式；不少平台不支持脚注、任务列表、Mermaid；图片外链有防盗链。
-3. **流程问题**：源文件一改，多平台要手动同步，diff 对不上，回归无从检查。
+1. **LLM 生成的 Markdown 并不标准。** 常见症状：代码块缩进混用、无谓转义（`\*`）、标题层级跳跃、正文里夹带 HTML 片段。
+2. **平台差异是持续变化的。** 用 sed/regex 写死的转换脚本，撑不过两次平台改版。
 
 ## 做法
 
-核心思路：**把 Markdown 当 AST 处理，而不是字符串**。管线分四层：
+我把管线拆成四层：
 
-```text
-AI 输出 → normalize → asset rewrite → [adapter] → validate → publish
-```
+**1. 源头约束。** system prompt 里限定严格 GFM：禁行内 HTML、代码块一律 fenced、标题从 H2 起步。这一步能在源头消掉一半问题。
 
-1. **归一化层**：用 remark 解析成 mdast，先做一遍 lint 修复——压平标题层级、识别加粗伪标题、统一列表缩进、剥离空段落。产物是"规范源"。
-2. **资产层**：扫描 image 节点，本地图和 base64 统一上传到对象存储或平台素材库，再改写 URL。这一步封装成 MCP tool 很顺手，Agent 在生成阶段就能预检素材可用性。上传失败要有降级，保留占位节点并打标。
-3. **适配层**：每个平台一个纯函数 `transform(mdast, config) -> 目标格式`。公众号走 mdast → HTML → 内联样式（Juice 这类工具）；掘金基本原样但需处理图片重传；静态博客直接走原管线。Mermaid 一律预渲染成 SVG。
-4. **校验层**：转换后再 lint 一次，查标题层级、死链、表格列数一致性，输出 diff 预览，人工确认后才发布。
+**2. 归一化层。** 落盘后先跑 remark + 自定义 lint：修列表缩进、剥多余转义、检查标题层级，同时统一中文排版（中西文间距、全半角标点，pangu 类规则包成 remark 插件即可）。产出 canonical Markdown + frontmatter，frontmatter 里声明目标平台列表。
+
+**3. 适配层。** 基于 mdast 写转换插件，每个平台一个 adapter，输入 canonical AST，输出平台方言。公众号走 HTML + 内联样式（样式表用 JSON 主题描述，方便换肤）；静态站做图片路径重写和 frontmatter 注入。
+
+**4. 校验层。** 每平台存 golden snapshot，发布前 diff 渲染结果，顺带检查图片可达性和死链。
+
+图片处理单独一路：加一个 download-and-reupload 节点，远程图片先落地、再传到目标平台或自有图床，回写 URL。
 
 ## 踩坑点
 
-- 内联样式转换别用正则硬写，Juice 现成方案稳得多，自己写必漏嵌套选择器。
-- 图片改写时机：**先上传后改写**，顺序反了会出现"上传成功但 URL 没换回"的脏数据。
-- 公众号代码高亮：highlight.js 输出的 class 会被剥掉，必须转成带内联颜色的 `span`。
-- 任务列表 `- [x]` 在部分平台静默丢失，适配层降级为普通列表加符号标记。
-- 数学公式是重灾区，`$...$` 行为各渲染器不一致，非必要不投到支持差的平台，或预渲染成图。
-- 长表格手机端必溢出，适配层里拆分或转列表。
-- 伪标题识别要保守，避免把真正的强调段落误升级成标题。
+- **正则改 Markdown 是最大的坑。** 代码围栏里的 `#`、`*` 会被误伤。所有转换必须走 AST，fenced code 天然是 leaf 节点，不会被打散。
+- **LLM 偶尔输出 4 空格缩进的“代码块”**，在列表上下文里会被解析成嵌套列表。源头约束 + lint 双保险。
+- **公众号会剥离 `<style>` 标签和 class**，SVG 也部分被清，只认内联 style。输出前必须再过一遍“内联化”步骤。
+- **frontmatter 未被支持的平台会把 `---` 渲染成分割线。** adapter 的第一步永远是摘掉 frontmatter。
+- **中文内容里的多余转义**（`\*`）在部分渲染器下直接显示反斜杠，肉眼很难在长文里发现，靠 lint 兜底。
 
 ## 可复用建议
 
-- **规范源是唯一事实来源**。平台产物一律视为缓存，可随时重建，禁止手工编辑。
-- adapter 写成无副作用纯函数：输入 mdast + 配置，输出字符串，天然好做单测和 dry-run。
-- 每个平台维护一份 manifest：支持的语法、图片限制、样式映射表。
-- 发布前跑一次多平台快照 diff，格式回归一眼可见。
-- 把 normalize 规则沉淀成 remark 插件，让 Agent 在生成阶段就约束格式——下游修得越少越好。
+- 每平台维护一份**能力矩阵**（表格/脚注/公式/mermaid 是否支持），adapter 据此自动降级，比如公式转图片、mermaid 转 PNG。
+- 把"发布"封装成一个 **MCP tool**：入参 markdown + target，让 agent 不感知平台差异。比让模型自己临场调格式可靠得多。
+- golden 文件进 CI，prompt 或转换规则改动后跑 snapshot 对比，避免“改了 A 平台坏了 B 平台”。
+- **canonical 文件是唯一事实源**，禁止直接手改平台产物，否则下次构建全部回滚。
 
 ## 总结
 
-这件事的本质不是写格式转换器，而是**把格式决策从发布时刻挪进管线**。AST 是中间表示，adapter 是插件边界，规范源是锚点。跑通之后，多平台发布从半小时的手工活变成一条命令；反过来，它也在倒逼上游 Agent 的 Markdown 质量——这大概是这条管线最划算的副产品。
+Markdown 适合当中间表示（IR），不适合直接当发布格式。这套管线的关键就三件事：源头约束、AST 级转换、快照校验——把格式适配从每次发布的手工活，变成可测试的构建步骤。remark/unified 生态的积木都是现成的，自建一套大概一个下午，之后每接入新平台只是多写一个 adapter。与其在发布日手忙脚乱，不如把这条管线跑通一次。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/3e4e8383b6a57cd9.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/d6caee3854321e62.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/434ba0ae82e54734.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/0119d86d4d29f12c.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/785b57f8417e54b3.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-16/cb88bac4ca5fee7a.png)
 
