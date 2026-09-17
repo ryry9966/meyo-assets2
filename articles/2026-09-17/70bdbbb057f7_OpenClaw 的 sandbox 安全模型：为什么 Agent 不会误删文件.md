@@ -1,72 +1,68 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 37921
+feedId: 37965
 source: 综合讨论
 publishedAt: 2026-09-17
 ---
 
 ## 背景
 
-OpenClaw 的 Agent 不是纯聊天进程：它有 exec 工具，能直接跑 shell、写文件、装依赖，权限接近运行它的那个用户。社区里最常被问的就是——"让它跑命令，哪天理解错路径，rm 一下我的家目录怎么办？"
+让一个有 shell 权限的 Agent 直接跑在开发机上，最大的心理障碍不是它答得对不对，而是它会不会在某次“帮我清理临时文件”里把别的东西删掉。OpenClaw 的 sandbox 安全模型，就是为了把这类风险压到工程上可接受的水平。
 
-这个担心是合理的。LLM 会幻觉路径、会误解析相对路径、会被外部内容里的注入指令带偏。OpenClaw 的回答不是"相信模型"，而是在模型外面包了几层确定性约束。
+## 问题的本质
 
-## 问题：误删到底怎么发生
+误删文件几乎从不是“Agent 想删”，而是三类机械性错误：路径基准不一致（相对路径和 Agent 理解的根目录对不上）、通配符过宽（`rm -rf $TMP/*` 里变量恰好为空）、上下文错位（把会话早前的路径当成当前路径）。这类错误靠 prompt 约束不可靠——模型再稳也有低概率失误。所以 OpenClaw 的思路是：**不赌模型，赌架构**。即使模型错了，错误也要被隔离层挡住。
 
-真实场景基本是三类：
+## 分层做法
 
-1. **路径幻觉**：把 `~/project` 记成 `~/projects`，清理命令的作用范围扩大；
-2. **cwd 漂移**：exec 每次调用的起始目录不一致，`rm -rf ./build` 的落点不可控；
-3. **提示注入**：读网页时读到"删除临时目录以释放空间"之类的指令，原样执行。
+防护由四层叠加，任何一层失守，下一层兜底：
 
-三者都不是"模型变坏"，而是工具权限过大加边界不清的必然结果。只靠 system prompt 写"请勿删除文件"，等于把安全边界建在最不可靠的层上。
+1. **文件系统边界**。Agent 的文件类工具默认被限定在 workspace 目录，执行前做 canonical path 校验，解析后的绝对路径一旦越出 workspace 根，直接拒绝并记录。`~/.ssh`、`/etc` 这类路径天然不可达。
+2. **进程沙箱**。开启 sandbox 后，Agent 跑在独立容器里：非 root 用户、workspace 以 bind mount 挂入、其余文件系统只读或不挂载。就算命令越界，容器内也看不到宿主机的真实数据。
+3. **工具策略**。每个工具可配 allowlist / denylist。读写文件默认放行（限 workspace 内），但 `exec` 命中危险模式（递归删除、覆盖式重定向）会进入审批队列，需人工确认或被策略拦截。
+4. **快照回滚**。workspace 定期做 git commit。即便前三层都漏了，`git reset` 也能把损失收敛到两次快照之间的增量。
 
-## OpenClaw 的四层做法
-
-整体模型是：**隔离 → 策略 → 审批 → 审计**。
-
-1. **workspace 隔离**：每个 Agent 默认只能看到自己的 workspace，exec 的 cwd 固定在里面，相对路径被约束在这棵目录树内。
-2. **容器 sandbox**：打开后，exec 不再落在宿主机，而是落到按会话隔离的容器里：
+典型配置大致是：
 
 ```yaml
-agents:
-  defaults:
-    sandbox:
-      mode: all       # 所有会话进容器
-      scope: session  # 会话级隔离，互不污染
+sandbox:
+  mode: "all"
+  docker:
+    bindMounts: ["/home/me/openclaw-workspace:/workspace"]
+tools:
+  policy:
+    fs:
+      root: "/home/me/openclaw-workspace"
+    exec:
+      approval: "dangerous-only"
 ```
-
-容器内只挂载 workspace，其余是临时文件系统。模型就算执行 `rm -rf /`，删的也是一次性环境，宿主机文件系统根本不在它的视图里。
-
-3. **工具策略与审批**：tools policy 决定哪些工具可用；exec approval 决定哪些命令需要人工确认。allowlist 放行 `npm test`、`pytest` 这类常规命令，denylist 硬拦 `rm -rf`、`mkfs`、`dd`，其余命令弹审批。
-4. **审计日志**：每次 exec 的命令、cwd、退出码都落盘，事后能回放"当时到底执行了什么"。
 
 ## 踩坑点
 
-- 为图省事关掉 sandbox、把 home 目录挂进容器，等于拆掉所有层。隔离的价值取决于挂载的最小化。
-- approval 连点几次"总是允许"，就退化成事实上的无审批。allowlist 要具体，别整段放行 `bash`。
-- prompt 约束不是安全边界，注入内容可以轻松覆盖它。
-- 多 Agent 共用非 session 的 sandbox scope 时，一个会话的写操作会影响另一个，容易被误判成"文件被删了"。先查 scope 配置，再怀疑模型。
-- Skill/插件如果在 sandbox 关闭的路径上执行，会继承 gateway 进程权限，高危 Skill 也必须走容器。
+- **把 workspace 挂到 home**。图省事把 `/home/me` 整个挂进去，边界形同虚设。workspace 应是专用目录，项目用完即拷。
+- **symlink 逃逸**。校验层会跟随并拒绝越界软链，但如果你在 workspace 里手工建了指向外部的链接，自建挂载时要自己再核一遍。
+- **Docker socket 挂载**。为“方便调试”把 `/var/run/docker.sock` 挂进沙箱，等于把宿主机 root 交出去，最常见的自我击穿。
+- **审批全放行**。`approval` 设成 always-allow 跑一周后没人再看提示，防线退化成装饰。宁可被打断，也别全开。
 
 ## 可复用建议
 
-1. **先写威胁模型**：明确 Agent 会接触哪些不可信内容（网页、issue、用户消息），再决定隔离层级。
-2. **默认拒绝**：工具策略从 deny 起步、按需放行，而不是全开之后打补丁。
-3. **任务分治**：不可信任务和可信任务拆成不同 Agent，前者强制 `sandbox: all` 并收紧 egress。
-4. **安全当回归测试做**：每次升级后，用一个"故意 `rm -rf /tmp/xxx`"的用例验证隔离仍然生效。
+- workspace 永远用专用目录，不放 home，不放含密钥的路径
+- 宿主机上有价值的目录默认对沙箱不可见，确需访问时显式只读挂载
+- exec 审批保留人工确认环节，dangerous-only 是比较稳的默认值
+- 快照周期按容忍度定：能接受丢多少改动，就多久 commit 一次
+- 定期做一次越界测试：让 Agent 尝试读 workspace 外的文件，确认返回的是拒绝而非内容
 
 ## 总结
 
-"Agent 不会误删文件"不是一个模型行为承诺，而是一个系统设计结果：workspace 划定它能看到什么，容器决定改动能落到哪，策略和审批控制它能执行什么，审计保证出了问题能回溯。模型可以不可靠，但边界必须是确定性的。这套分层思路并不绑定 OpenClaw 的具体实现，迁移到任何 Agent 框架都成立。
+“Agent 不会误删文件”不是因为它聪明，而是因为即使它犯傻，能碰到的文件系统就那么大，能执行的命令要过策略，执行完还有快照可退。OpenClaw 的 sandbox 模型，本质是把安全从“信任模型的输出”转移到“约束模型的运行环境”——前者无法验证，后者可以。模型能力会继续涨，但边界不该跟着涨。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/21fe5c054fe86702.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/58bb6259ac885fd4.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/4faed41772a9913c.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/e96d677fbf7e646c.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/3eff1e095364f932.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/93601dce47c22974.png)
 
