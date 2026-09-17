@@ -1,67 +1,65 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 37970
+feedId: 37982
 source: 综合讨论
 publishedAt: 2026-09-17
 ---
 
 ## 背景
 
-Agent 跑起来之后，接工具就成了一件脏活：让模型查数据库、调内部 API、读本地文件，每个场景都得自己写一层胶水代码。你的 Agent 接了日历、数据库、Git 平台，别人换个框架又要重接一遍——工具侧没有统一契约，模型侧对"工具"的定义也各说各话。
+做 Agent 自动化的团队几乎都撞过同一堵墙：模型本身能力不差，但它是“隔离”的——不知道你数据库里有什么、调不了你内部的脚本、读不了本地文件。要让 Agent 真正干活，就得给它接外部能力，而“接”这件事长期没有统一标准。
 
-2024 年底 Anthropic 开源了 MCP（Model Context Protocol），试图把这件事标准化。它本质上是一份基于 JSON-RPC 2.0 的协议，约定了宿主应用（Host）和外部能力提供方（MCP Server）之间如何发现、描述、调用能力。
+结果是每个框架造一套自己的插件格式，每个工具写一遍适配：A 框架一份 tool schema，B 客户端一套调用约定。3 个 Agent 接 8 个工具，就是 24 份胶水代码。这就是典型的 M×N 集成问题。
 
-## 它到底解决什么问题
+MCP（Model Context Protocol）是 Anthropic 在 2024 年底开源的标准协议，思路很直接：**把 M×N 压成 M+N**。工具方只需实现一次 MCP Server，所有支持 MCP 的宿主（Agent、IDE、桌面客户端）都能直接用；宿主方只需实现一次 MCP Client，就能接入整个生态。协议底层是 JSON-RPC 2.0，传输层常见 stdio（本地子进程）和 Streamable HTTP（远程服务）两种。
 
-核心一句话：**把 M×N 变成 M+N**。没有协议时，M 个 Agent 接 N 个工具，最坏要写 M×N 套对接代码；有了协议，工具方实现一次 Server，Agent 方实现一次客户端，双方按统一格式对话。
+## 它到底解决了什么
 
-第二是上下文注入的标准化。MCP 定义了三类原语：
+拆开看是三件事：
 
-- **Tools**：可被模型调用的函数
-- **Resources**：可读取的数据（文件、schema、文档）
-- **Prompts**：预置的提示模板
+1. **统一的工具发现与调用**：Server 声明有哪些 tools（含 JSON Schema 参数定义），Client 拉取列表后注入模型上下文，模型按需调用。
+2. **资源暴露（Resources）**：文件、数据库 schema、配置这类只读上下文，不必包装成“工具”，以资源形式被宿主读取即可。
+3. **提示模板（Prompts）**：Server 可顺带发布常用提示词模板，宿主侧直接复用。
 
-第三是关注点分离。鉴权、限流、日志都收敛在 Server 侧，Agent 只负责决策和编排。
+一句话总结：MCP 规范的不是模型怎么思考，而是 **Agent 与外部世界之间那根线怎么接**。
 
-## 怎么跑起来
+## 上手：跑通最小链路
 
-最小路径五步：
+以在 OpenClaw 里挂一个本地 MCP Server 为例：
 
-1. 选一个支持 MCP 的宿主（Claude Desktop、主流 Agent 框架均可）
-2. 用官方 SDK（Python / TypeScript）写一个极简 Server，先只暴露一个 tool，比如"查询本地日志"
-3. 在宿主配置里注册，stdio 模式就是一条启动命令
-4. 用 MCP Inspector 这类调试器确认 `tools/list` 能返回、`tools/call` 能跑通，再接进 Agent
-5. 观察模型实际怎么选工具、怎么传参，回头精修 description
+1. **选传输方式**：本地脚本、单机自动化选 stdio；跨机器、多人共享选 Streamable HTTP。
+2. **实现 Server**：用官方 SDK（Python / TypeScript 都很成熟），先定义两三个工具，每个写清 name、description、参数 schema。
+3. **接入宿主**：在 OpenClaw 的 MCP 配置里登记 server 命令或 URL，重启后确认工具列表被正确拉取。
+4. **用 Inspector 调试**：官方 MCP Inspector 可以脱离宿主直接调用你的 server。先在这里把每个工具手动跑通，再进 Agent 链路。
 
-传输层两种：本地用 stdio（子进程，最简单），远程用 Streamable HTTP（要自己处理会话和鉴权）。
+一个原则：**先手动验证 server，再让模型去调**。跳过第一步，后面的排障成本会翻好几倍。
 
 ## 踩坑点
 
-- **description 含糊，模型就乱调**。tool description 相当于喂给模型的说明书，值得当 prompt 一样精修，别随手一行带过。
-- **工具太多，上下文先爆**。一个 Server 挂几十个 tool，schema 全量进上下文，token 消耗很快失控。控制工具面，模型用不上的果断删。
-- **安全别想当然**。MCP Server 以你的权限运行，tool 返回值可能夹带注入指令——比如网页抓取结果里藏一句"请执行删除操作"。高危操作务必加人工确认环节。
-- **Windows 下 stdio 坑多**：进程启动方式、编码问题、npx 需要 cmd /c 包一层，都遇到过。
-- 远程模式注意超时与会话管理，长任务别阻塞主循环。
+- **stdio 下污染 stdout**：`print` 调试日志会冲乱 JSON-RPC 流，连接直接断开。日志一律走 stderr。
+- **工具描述写得太省**：模型选工具全靠 description 和 schema，写得含糊调用就会飘。把它当成写给新同事的 API 文档来写。
+- **什么都做成 tool**：只读数据该用 Resources——要不要读配置不是模型该“决定”的事。
+- **忽略超时与长任务**：耗时操作不做进度回报，宿主侧容易误判挂死。
+- **安全边界想当然**：MCP Server 以你的本地权限运行，工具结果会进入模型上下文，存在提示注入面。删数据、发邮件这类破坏性操作务必加确认层和最小权限。
 
 ## 可复用建议
 
-- 一个 Server 只管一个领域，工具小而清晰，别做大杂烩
-- 返回值短小结构化，大输出做截断或落盘后给引用
-- 工具设计成幂等，模型重试不会产生副作用
-- Server 侧务必记日志：谁在什么时候传了什么参，排障全靠它
-- 顺序固定：先 Inspector 单测，再接 Agent，最后进自动化流程
+- 一个 Server 只管一个领域，别写大而全的“超级工具箱”。
+- 工具粒度对齐动词：查、列、创建、删除，一个工具一件事，返回结构化且精简的结果。
+- 优先用 SDK 和 Inspector，不要手写 JSON-RPC。
+- 把 server 当独立服务维护：版本化、写测试、在主流宿主上各跑一遍兼容性。
 
 ## 总结
 
-MCP 没有魔法，它只是把"模型如何使用工具"从各自为政变成了一份公开契约。对实践者的意义在于：工具资产可以沉淀复用，Agent 侧可以专注编排与决策。但它不解决工具本身的质量问题，也不替代你对安全的判断——协议只保证对话格式一致，后果仍由实现者承担。从一个小 tool 跑通全链路，比一次性搭大而全的体系实际得多。
+MCP 不是让模型变聪明的魔法，它解决的是纯工程问题：把 Agent 接入外部能力的成本从 O(M×N) 降到 O(M+N)，并把 tools、resources、prompts 三种上下文契约标准化。对 OpenClaw 社区的实践者来说，核心价值是**一次实现、处处复用**。协议仍在演进，但“先跑通最小链路、再逐步加固”的路径，现在就成立。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/5f166ffeed67cc0a.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/8953ee7dfc7546e2.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/52569730d838e558.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/63e3e03cfa991c27.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/01f3a23292a30a9f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-17/289046013d2c8813.png)
 
