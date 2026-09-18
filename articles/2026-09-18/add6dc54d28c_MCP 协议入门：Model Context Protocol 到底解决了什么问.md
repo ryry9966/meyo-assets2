@@ -1,66 +1,76 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 38033
+feedId: 38072
 source: 综合讨论
 publishedAt: 2026-09-18
 ---
 
 ## 背景
 
-接大模型做 Agent，绕不开一个问题：模型本身只会生成文本，真正干活要靠外部工具。读写数据库、调内部 API、操作文件系统……这些"手"怎么接上去，过去一直没有统一答案。
+过去一年做 Agent 的人基本都在重复同一件事：让模型连上外部系统——查数据库、读工单、操作浏览器、调内部 API，每接一个工具就得为当前框架写一层胶水代码。2024 年底 Anthropic 开源了 Model Context Protocol（MCP），把这条"最后一公里"标准化。目前主流客户端和多数 Agent 框架都已支持，它正在成为工具接入的事实接口。
 
-MCP（Model Context Protocol）是 Anthropic 在 2024 年底开源的协议，目标是把"模型如何调用外部能力"这件事标准化。目前主流 Agent 框架和 IDE 都已支持，在 OpenClaw 的插件与自动化体系里，它也是最常用的接入方式之一。
+## 它解决了什么问题
 
-## 它解决的真实问题
+一句话：把 M×N 的集成问题变成 M+N。
 
-没有 MCP 时，这是典型的 M×N 问题：M 个宿主（Host）要接 N 个工具/数据源，每个组合都得写定制对接代码。你写了个抓取工具，只能在自家脚本里用，换一个宿主就得重写。
+没有 MCP 时，M 个宿主应用要对接 N 个工具/数据源，理论上需要 M×N 套适配代码，而且各家插件接口互不兼容，写完不可迁移。MCP 用基于 JSON-RPC 2.0 的协议把两端解耦：工具方实现一次 Server 即可被所有宿主使用；宿主实现一次 Client 即可接入所有现成 Server。顺带统一了三件事：工具发现、调用约定（参数 schema）、上下文注入。
 
-MCP 的做法是把中间层拆出来：
+需要泼一盆冷水：MCP 不提升模型能力，也不解决提示词工程问题，它只是一份接口契约。价值在复用，不在"变聪明"。
 
-- **Host**：跑模型的客户端（Agent 框架、IDE 等），内置 MCP Client
-- **Server**：独立的轻量服务，声明自己提供哪些 tools / resources / prompts
-- **传输层**：本地用 stdio，远程用 Streamable HTTP
+## 协议结构与上手步骤
 
-Server 只需实现一次协议，任何支持 MCP 的 Host 都能直接挂载。核心价值一句话：**把集成成本从 M×N 降到 M+N**。
+三个角色：
 
-## 实际做一个 MCP Server 的步骤
+- **Host**：Agent 宿主，桌面客户端或你自己的 Agent 进程；
+- **Client**：Host 内部的连接器，与 Server 一对一通信；
+- **Server**：能力提供方，暴露三类原语——tools（模型调用）、resources（注入上下文）、prompts（提示模板）。
 
-以 Python SDK 为例：
+两种传输：**stdio**（本地子进程，适合开发调试）和 **Streamable HTTP**（远程部署、团队共享；旧版 SSE 双通道传输已被规范废弃，选型时注意版本）。
 
-1. 安装 SDK，用 FastMCP 定义 server；
-2. 用 `@mcp.tool()` 暴露函数，写清楚参数 schema 和描述；
-3. 本地先跑 stdio 传输，用官方 Inspector 工具手测每个工具的调用与返回；
-4. 挂到目标 Host 做端到端验证；
-5. 稳定后再迁到 Streamable HTTP + 鉴权，供团队复用。
+上手建议三步：
+
+1. 先跑现成 Server。filesystem、git、postgres、playwright 等官方维护的 Server 覆盖大部分场景，配置通常就是一段 JSON：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+    }
+  }
+}
+```
+
+2. 在你的 Agent 里 list 一次 tools，看模型实际拿到的描述长什么样——这直接决定调用质量。
+3. 确认有必要后再自研 Server。包一层内部 API、读内部库这类需求，用官方 SDK 一两百行就能跑起来。
 
 ## 踩坑点
 
-- **stdout 污染**：stdio 模式下 stdout 只能走 JSON-RPC，`print` 调试日志会直接把会话打挂，日志一律走 stderr。
-- **工具描述敷衍**：描述是模型选工具的唯一依据。"do something" 式的描述会让模型乱调或拒绝调用，请当成写给陌生人的 API 文档来写。
-- **工具太多**：一次注入几十个工具，上下文膨胀、误选率上升。合并同类工具，用一个带 `action` 参数的工具替代一组细粒度工具，往往效果更好。
-- **返回值过大**：工具把整张表吐回去，几轮就把上下文吃满。务必做分页、截断、摘要。
-- **协议版本不匹配**：Host 与 Server 版本差异会导致能力协商失败，升级 Host 后记得回归测试旧 Server。
-- **安全**：不要随意加载来源不明的 Server；工具返回内容本身也是注入入口，写操作要有确认机制和幂等设计。
+- **stdio Server 的日志别打到 stdout**：stdout 是 JSON-RPC 通道，一条杂音日志就能让整个连接解析失败，日志一律走 stderr。
+- **工具描述就是新的提示词**：描述含糊，模型要么不调、要么乱传参。写完工具务必用真实任务回归测试，别只看 schema 对不对。
+- **参数 schema 越简越好**：深嵌套、多必填会显著拉高调用失败率，也吃上下文窗口；一个宿主挂几十个工具时，光描述就可能占掉不少 token。
+- **安全上别裸奔**：MCP Server 本质是给模型一段可执行代码，第三方 Server 等于供应链依赖，装之前过一遍源码；涉及写操作默认不要 auto-approve，加人工确认。
+- **规范仍在演进**：传输层、鉴权都在变，客户端和服务端版本不匹配是远程部署最常见的故障源，部署时锁定版本。
 
-## 可复用的建议
+## 可复用建议
 
-- 先在本地 stdio + Inspector 跑通，再考虑远程化，不要一上来就折腾鉴权和部署；
-- 每个 Server 聚焦一个领域，宁可多个小 Server，不要一个巨型 Server；
-- 给所有工具调用记结构化日志，排查"模型为什么这么调"全靠它；
-- 工具命名带领域前缀（如 `github_create_issue`），降低跨 Server 撞名与误选概率；
-- 写操作工具返回操作 ID 和结果状态，方便宿主层做确认与回滚。
+- 能用现成 Server 就不自研；自研优先包内部 API，别重复造 filesystem 这类轮子。
+- 工具设计成粗粒度、单一职责，返回结构化、对模型友好的结果，别吐一坨原始 HTML。
+- 本地开发用 stdio，团队共享用 Streamable HTTP + 网关统一做鉴权与审计。
+- 给"模型是否正确调用"建一个小评测集，工具改动就跑一遍，比肉眼盯对话可靠得多。
 
 ## 总结
 
-MCP 本身并不神秘，它解决的是集成标准化这个老问题，类似 USB-C 之于外设。协议层很简单，难点在工具设计：描述怎么写、返回怎么裁剪、权限怎么收。协议是固定的，**工具质量才是 Agent 能力的上限**。建议从把一个内部 API 包成 MCP Server 开始，跑通全链路后再谈规模化。
+MCP 解决的不是模型问题，而是集成问题：用一份开放契约替换掉各自为政的插件接口，让工具生态第一次可以在不同宿主之间复用。它朴素、甚至有点无聊——JSON-RPC、schema、进程通信，都是老东西。但对做 Agent 和自动化的人来说，"无聊且统一"恰恰是基础设施该有的样子。建议从挂一个现成 Server 开始，跑通一条真实业务链路，再决定投入多深。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-18/821c67e3967f833b.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-18/4acf0ae6d29e5199.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-18/ccb918f641d8b35e.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-18/9c91dbd58179e9d8.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-18/f3f8480d96598def.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-18/4ec78718ab8b9a65.png)
 
