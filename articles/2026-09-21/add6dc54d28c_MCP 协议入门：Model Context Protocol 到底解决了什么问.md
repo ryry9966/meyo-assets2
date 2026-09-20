@@ -1,73 +1,64 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 38287
+feedId: 38302
 source: 综合讨论
 publishedAt: 2026-09-21
 ---
 
 ## 背景
 
-过去两年写 Agent 自动化的人基本都绕不开一个尴尬：模型本身能力不差，但它被困在对话框里，碰不到你的数据库、内部 API 和本地文件。要让 Agent 真正干活，就得给它接工具。
+给模型接外部能力这件事，过去两年的常态是"各写各的胶水"：Agent 框架有自己的 plugin 格式，IDE 有自己的扩展约定，桌面助手又是一套 function calling。同一个"查内部数据库"的能力，换一个宿主就要重写一遍，彼此互不兼容。
 
-MCP（Model Context Protocol）是 Anthropic 在 2024 年底开放的一套协议，目标是把"模型怎么接工具"这件事标准化。一年多下来，它已经成了事实标准，主流客户端和大量社区 Server 都在支持。
+MCP（Model Context Protocol）是 Anthropic 在 2024 年底开源的协议，目标就是把"模型应用 ↔ 外部能力提供方"这一层标准化。可以把它理解成 AI 应用的 USB-C：宿主实现一次客户端，能力方实现一次 server，中间靠协议对话。
 
-## 它到底解决了什么问题
+## 它到底解决什么问题
 
-在 MCP 之前，接工具是一个 M×N 问题：M 个 Agent 框架 × N 个数据源，每个组合都要写一遍胶水代码。你的消息机器人、CLI 助手、CI 工具各自实现各自的调用格式，几乎无法复用。
+核心是 **M×N 集成问题**。M 个应用要接 N 种工具/数据源，没有标准时是 M×N 套适配代码；有了 MCP，收敛成 M+N。你写的 server 不绑定任何宿主，谁支持协议谁就能用。
 
-MCP 把 M×N 变成 M+N：Agent 框架只需实现一次 MCP Client，每个数据源只需实现一次 MCP Server，中间用统一协议对话。这就是它的核心价值——不是让模型更聪明，而是让整个生态的接口长一个样。
+其次它把职责切干净了，协议里三类原语各管一摊：
 
-## 协议结构：三分钟版
+- **Tools**：模型可以调用的动作（发消息、跑查询）
+- **Resources**：应用侧管理的上下文数据（文档、配置）
+- **Prompts**：用户手动触发的模板
 
-MCP 采用 Host–Client–Server 架构：
+能力方不用关心宿主怎么渲染、模型怎么路由，只暴露契约。
 
-- **Host**：运行模型的宿主应用，比如你的 Agent 运行时
-- **Client**：Host 内的连接器，与单个 Server 一对一通信
-- **Server**：暴露能力的轻量进程，可以是本地脚本，也可以是远程服务
+## 最小可用路径
 
-Server 对外提供三类原语：
-
-- **Tools**：模型可主动调用的动作，如"查订单""发消息"
-- **Resources**：可读取的上下文数据，如文件内容、表结构
-- **Prompts**：预置的提示模板
-
-传输层常见两种：`stdio`（本地子进程，适合个人自动化）和 Streamable HTTP（远程部署，适合团队共享）。
-
-## 上手步骤
-
-以接一个内部 REST API 为例：
-
-1. 选 SDK：官方提供 Python（FastMCP）和 TypeScript SDK，几十行就能起一个 Server
-2. 定义工具：把 API 的每个操作包成一个 tool，写清 name、description 和参数 schema
-3. 本地跑通：用 stdio 模式启动，在支持 MCP 的客户端里手动调用一次，确认返回结构正常
-4. 接入 Agent：在 OpenClaw 类运行时里注册这个 Server，观察模型是否正确选到工具
-5. 看日志：重点核对模型传入的参数和你的预期差多少
+1. 选官方 SDK（Python / TypeScript 都有），先起一个 stdio 传输的本地 server
+2. 用 `@mcp.tool` 装饰器暴露第一个工具，比如查内部 wiki，二三十行就能跑
+3. 认真写 description 和 JSON Schema 参数——这是给模型看的接口文档，不是给人看的注释
+4. 用官方 Inspector（`npx @modelcontextprotocol/inspector`）单独调试，确认工具能被列出和调用
+5. 在宿主（OpenClaw、Claude Desktop、各类 IDE）的 MCP 配置里注册，跑通端到端
+6. 需要团队共享时，换 Streamable HTTP 传输，前面加鉴权
 
 ## 踩坑点
 
-- **description 含糊，模型就选错或不选工具**。工具名和描述本质是写给模型看的文档，按 API 文档的标准来写。
-- **工具一多模型就懵**。单个 Server 控制在十来个 tool 以内，超了就按业务域拆分。
-- **stdio 进程的生命周期**：Server 随 Host 退出而退出，长任务要处理中断；调试信息别打到 stdout，会污染协议帧。
-- **安全**：第三方 Server 能以你的权限执行动作，接入前审一遍代码；生产环境最小权限，高危操作加人工确认。
-- **版本兼容**：协议仍在演进，Client 和 Server 版本差太多会出现 capability 协商失败。
+1. **stdout 污染**：stdio 传输下 stdout 是协议通道，`print` 调试信息会直接打崩 JSON-RPC 流。日志一律走 stderr，这个坑几乎人人都踩过。
+2. **工具描述写得太省**：description 模糊、参数没有示例，模型要么不调、要么乱传参。工具描述本质是 prompt engineering，值得投入一半工时。
+3. **工具数量膨胀**：单个 server 塞 30 个工具，选择准确率肉眼可见地下滑。按领域拆 server，单 server 控制在个位数到十几个工具。
+4. **写操作没有闸门**：删数据、对外发消息这类动作，协议本身不替你做权限，默认要自己加确认层。
+5. **协议版本漂移**：spec 迭代很快（2024-11-05 → 2025-03-26 → 2025-06-18），宿主和 server 版本要对齐，升级前先看 changelog。
+6. **Windows 下 stdio 起不来**：配置里直接写 `npx` 常常拉不起进程，需要套一层 `cmd /c`。
 
 ## 可复用建议
 
-- 把内部系统逐个包成 MCP Server，比每个 Agent 重复造轮子划算得多
-- 维护一个小型评测集，验证"模型选工具的准确率"，改 description 前后各跑一遍
-- 工具返回值尽量结构化且短，长文本让模型按需分页拉取
+- MCP server 只做薄封装，业务逻辑留在已有的内部 API 里，协议层随时可替换
+- 错误返回结构化、模型可读的文本，让模型能自我纠错，而不是抛一段堆栈
+- Resources 和 Tools 别混用：静态数据走 Resources，动作走 Tools
+- 把 server 当产品维护：版本号、变更记录、兼容性说明，一个都别少
 
 ## 总结
 
-MCP 解决的不是模型能力问题，而是集成成本问题。它把混乱的胶水层收敛成一个标准接口，让"接工具"从一次性工程变成可积累的资产。对做 Agent 自动化的团队来说，越早把内部能力 MCP 化，后续的组合成本就越低。
+MCP 不是模型能力上的突破，而是一层务实的基础设施标准化：把重复的胶水代码收敛成协议，把"能力供给"从"应用开发"中解耦出来。工程量的重心从写适配器，转移到了设计清晰的工具契约上。如果你的 Agent 正在反复造查库、发通知、读文档的轮子，值得花一个下午把其中一块封装成 MCP server——接入一次，所有兼容宿主直接复用，收益很直接。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/40bbdb2b0745f6ab.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/66532b197297d170.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/4568856e963e1838.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/0afa95db10ebea35.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/95319ac7d5448149.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/9bd54491cece14b6.png)
 
