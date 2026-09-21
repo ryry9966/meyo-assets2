@@ -1,52 +1,62 @@
 ---
 title: Markdown 管线：从 AI 生成到多平台发布的格式适配
-feedId: 38311
+feedId: 38333
 source: 综合讨论
 publishedAt: 2026-09-21
 ---
 
 ## 背景
 
-在 Agent 工作流里，AI 产出的初稿几乎都是 Markdown。但"生成完成"不等于"可以发布"：GitHub 认 GFM 全集，知乎会剥掉大部分内联 HTML，公众号只接受带内联样式的富文本，掘金又有自己的扩展语法。同一份稿子发三个渠道，手工适配往往要改三轮，而且每轮都可能改出新问题。
+我们让 OpenClaw 起草技术内容已经跑了一段时间：agent 出稿、人工校对、多渠道分发。很快发现瓶颈不在生成，而在“最后一公里”——同一篇 Markdown 要发到博客、公众号、知乎、掘金，每个平台的格式规则都不一样，手工适配又慢又不可复现。
 
 ## 问题
 
-把适配做成手工活有三个代价：一是不可复现；二是 AI 生成的 Markdown 本身就不规范——标题层级跳跃、列表嵌套错位、混入裸 HTML 和未转义字符，人工修补容易漏；三是新增平台时适配逻辑散落各处，没法测试也没法回归。
+AI 生成的 Markdown 离“可直接发布”有距离，两层问题叠在一起：
+
+**生成质量**：开场白（“好的，以下是……”）、有时全文被包在 ```markdown 围栏里、标题层级从 ## 开始、代码块缺语言标注、中英文标点与空格混排。
+
+**平台差异**：公众号不认原生 Markdown，图片必须走素材库，表格基本不可用；知乎和掘金的 HTML 白名单各不相同；标题、摘要长度限制也各有一套。
+
+人肉适配的结果是：博客版改完，公众号版已经漂移，换个人就复现不了流程。
 
 ## 做法
 
-核心思路：**源 Markdown 只有一份，平台差异全部表达为转换，转换基于 AST 而不是字符串替换。**
+我们把管线拆成三层，核心原则是 **normalize once, adapt at the edge**：
 
-1. **规范化入口**。发布前先过 lint（remark-lint 或 markdownlint），强制标题从固定层级开始、统一列表缩进、代码块必须标注语言。AI 输出不规范是常态，别指望 prompt 解决所有问题。
-2. **AST 转换层**。用 unified/remark 解析成 mdast，按平台写 transform 插件：公众号渲染器把代码块转成内联样式 HTML；知乎目标剥离 footnote、对表格做降级；不支持任务列表的渠道转普通列表加文字前缀。所有操作落在 AST 层，输出可预测、可 diff。
-3. **MCP 工具封装发布**。每个渠道一个 MCP tool，入参统一为规范化后的 Markdown 加平台参数，出参是发布回执链接。Agent 只管调用，不感知平台差异。
-4. **落盘中间产物**。每次转换保存 source.md、转换后 HTML 和 manifest.json（记录插件与规则版本），排障时逐层 diff。
+**1. 规范化**：agent 输出先过 lint 修复。入口检测并剥掉 LLM 的包裹围栏和开场白，统一标题从 h1 开始，补全代码块 language，中英文之间加空格，标点归一。所有文本变换基于 remark 的 mdast AST 而不是正则，且跳过 code 节点；修复要求幂等——同一输入跑两遍结果一致。
+
+**2. 结构转换**：canonical Markdown 是唯一事实源，平台版本全部是构建产物。链路用 unified 生态：remark-parse → 自定义 mdast 插件（表格转列表、剔除平台不支持的节点）→ remark-rehype → 按平台 profile 走不同的 rehype 插件链。
+
+**3. 平台适配**：每个平台一个 YAML profile：标签白名单、代码高亮方案、图片策略、标题/摘要长度上限。公众号这类只吃内联样式的，rehype 之后接 juice 做 CSS 内联；图片先传平台素材库，拿到 CDN URL 再回写正文。
+
+最后把整条管线封成 MCP tools：`validate_markdown` / `adapt_for_platform` / `publish`，agent 编排时先 validate，人工确认后才 publish。
 
 ## 踩坑点
 
-- 正则替换是最大的坑。嵌套代码块里的分隔线、表格里的竖线都会被误伤，务必走 AST。
-- 图片链接：模型常生成相对路径，图床上传必须作为管线里的显式步骤，不能靠发布时手补。
-- 公众号编辑器粘贴时会吞掉部分属性，验证要走真实粘贴流程，不能只看渲染出的 HTML。
-- 数学公式和 footnote 是重灾区，多数平台不支持，要么转图片要么明确降级，别静默丢内容。
-- transform 必须幂等，并配快照测试，平台改版后才有回归依据。
+1. **别用正则处理 Markdown**。代码块里一段含特殊字符的示例就能把全局替换打穿，文本级变换必须在 AST 上做；
+2. 标点/空格归一化同样要排除代码块，否则代码全被“格式化”；
+3. 公众号外链图片预览正常、发布后裂图（防盗链），必须走素材上传并回写 URL；
+4. front matter 忘剥，标题栏出现一堆 YAML；
+5. 不要同时新开多个平台的 profile，先跑通一个再横向复制，否则出错难定位。
 
 ## 可复用建议
 
-- 新平台接入顺序：先写降级策略（明确哪些语法不支持），再写 transform，最后写发布 tool。
-- lint 规则收敛为一份共享配置，生成端和发布端用同一套，避免"生成合规、发布报错"。
-- 转换器保持纯函数：输入 Markdown、输出 Markdown/HTML，不夹带 IO，方便单测和跨项目复用。
+- canonical 源文件进 git，平台产物视为可重建的缓存；
+- 给管线写 golden test：固定几篇样例文档断言输出快照，平台改版时 diff 一眼可见；
+- 规则配置化、可覆盖：某条规则对某平台不适用，就在 profile 里覆盖，别 fork 管线；
+- adapt 和 publish 分开，发布前永远留人工 checkpoint。
 
 ## 总结
 
-这条管线的本质，是把格式适配从"人的经验"变成"可测试的代码"。规范化入口、AST 转换、MCP 封装三段各司其职之后，新增平台的成本就从"重新手改一遍"降到"一个 transform 加一个 tool"。OpenClaw 的插件机制可以直接承载这套结构，各平台 transform 的实现差异很值得在社区里对齐，欢迎贴出来一起看。
+一句话：生成端只负责产出一份干净的 canonical Markdown，所有平台差异收敛到 profile 层；用 AST 不用正则，产物可重建，发布前留人。跑通之后，多平台发布从每次半小时的手工活，变成了 CI 里的一步。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/04ce36c836d5e37b.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/045f60bfb645bccd.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/5e539a856b755943.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/5887757a9c3598c5.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/f38316f406bdefa6.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-21/9195a9d60242454b.png)
 
