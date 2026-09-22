@@ -1,65 +1,50 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 38475
+feedId: 38491
 source: 综合讨论
 publishedAt: 2026-09-22
 ---
 
-## 背景：上下文预算是稀缺资源
+## 背景
 
-跑过一段时间 OpenClaw 的人多半有类似体验：为了让助手"会做事"，我们习惯把操作手册、常用命令、注意事项一股脑塞进 system prompt 或 AGENTS.md。结果常驻上下文越滚越大，真正被用到的内容不到两成。MCP 解决的是"工具怎么接进来"，但工具列表和描述本身也常驻 token。Skills 机制针对的正是这个问题：把能力拆成独立文件，启动时只暴露一行描述，模型判断相关后才加载全文——也就是渐进式披露（progressive disclosure）。
+Agent 框架最常见的问题就是上下文膨胀：为了让助手"什么都会"，把所有工具说明、操作手册、领域知识一股脑塞进 system prompt。结果上下文动辄几万 token，模型注意力被稀释，真正用到的能力不到一成，而且每轮对话都在为闲置内容付费。
 
-## 一个 Skill 长什么样
+OpenClaw 的 Skills 机制用"渐进式披露"（progressive disclosure）来解决这个问题：会话启动时只注入每个技能的元数据（name + description，各一行），完整的 SKILL.md 正文只有当模型判断当前任务相关时才会读取。本质上是把能力说明书从常驻内存改成了按需分页。
 
-一个 Skill 就是一个目录，核心是 SKILL.md：
+## 做法
 
-```markdown
----
-name: daily-report
-description: 生成每日运维日报。当用户要求"出日报""汇总今天的告警"时使用。
----
-
-## 步骤
-1. 读取今日告警列表 ...
-2. 按服务分组统计 ...
-```
-
-frontmatter 的 `description` 是模型开机就能看到的全部信息；正文只有在模型决定调用时才进入上下文。常驻成本是几十 token，正文写多长都不影响日常会话。
-
-## 实操步骤
-
-1. 建目录：workspace 下建 `skills/daily-report/SKILL.md`（全局能力可放 `~/.openclaw/skills/`）。
-2. 写 description：建议"做什么 + 何时触发"的句式，这是决定命中率的唯一检索入口。
-3. 正文只写模型不知道的东西：内部约定、路径、命令序列，别复述常识。
-4. 验证：`openclaw skills list` 确认已加载，`openclaw skills info <name>` 看解析详情。
-5. 实测触发：用自然语言问一句，观察模型是否命中并展开正文。
+1. **建目录。** 每个技能一个独立目录，入口固定是 `SKILL.md`，放在 agent workspace 的 skills 目录下。
+2. **写 frontmatter。** 关键字段只有 `name` 和 `description`。description 是模型决定"要不要加载"的唯一依据，必须写成触发条件的描述，而不是功能宣传。例如："use when the user asks to export weekly reports to Excel, generate xlsx files, or format spreadsheets"——具体动词、具体产物、具体文件类型。
+3. **写正文。** SKILL.md 正文控制在 200 行以内，只写模型不知道的事：本项目的路径约定、命令用法、边界条件。模型已知的通用知识不要重复。
+4. **挂辅助文件。** 确定性操作写成脚本（如 `scripts/export.py`），正文里只写"何时调用、参数含义"。大段参考资料放 `references/`，正文指引模型按需读取。
+5. **重启验证。** 用一句明显触发该技能的话测试，看日志确认 SKILL.md 是被触发后才读取的，而不是启动时全量加载。
 
 ## 踩坑点
 
-- **description 写成关键词堆砌**（"日报 报告 汇总 统计"）：容易误触发。写成一句自然语言、带上触发场景，命中率明显更好。
-- **正文塞满背景故事**：skill 被加载后同样占上下文，只保留可执行步骤和硬信息。
-- **多个 skill 职责重叠**：模型会犹豫或选错，定期合并、删旧的。
-- **正文里引用脚本用了相对路径**：执行时的工作目录未必是你以为的那个。脚本要么放进 skill 目录、在正文写清路径约定，要么统一走 workspace 路径。
-- **frontmatter 格式错误**：`---` 分隔符缺失、字段名拼错，整个 skill 不被识别。`skills list` 里看不到，先查格式。
+- **description 写成营销文案。**"强大的 Excel 处理技能"不会触发任何东西；"export xlsx / pivot table" 才会。
+- **把全部逻辑塞进 frontmatter。** 元数据是每轮对话的常驻成本，塞得越多亏得越多。
+- **一个技能干三件事。** 触发条件混在一起，模型要么全加载要么不加载，拆成三个小技能命中率更高。
+- **脚本路径写死。** 绝对路径换台机器就失效，用相对 workspace 的路径，并确认可执行权限。
+- **技能数量失控。** 几十个技能的元数据本身就是一份不小的索引，定期删掉三个月没触发过的。
 
 ## 可复用建议
 
-- **分工原则**：MCP 管"连什么工具"，skill 管"怎么组合这些工具完成某类事"。把稳定流程从 prompt 迁到 skill，是性价比最高的瘦身。
-- 一个 skill 一个职责，宁可多建几个小的，不要造大而全的"百科 skill"。
-- description 是写给模型的检索接口，按实际命中情况持续迭代，它和代码一样需要维护。
-- 团队场景把 skills 目录放进仓库一起版本化，新人 clone 下来，助手就自带全套作业规范。
+- description 模板："use when \<具体场景\>, involving \<具体文件/命令/产物\>"。
+- 能用脚本表达的不要用自然语言描述，脚本是零歧义的。
+- 把 skills 目录放进 git，改动走 commit，可回溯、可回滚。
+- 排查"技能不触发"时，先看日志里模型实际看到的元数据列表——多数情况是 description 没写对，而不是机制坏了。
 
 ## 总结
 
-Skills 机制的本质，是把 prompt 工程从"一篇大文档"变成"可索引的能力库"：常驻成本压到最低，需要时才展开。我的体感是，把十几个常用流程迁进 skills 后，常驻 prompt 缩了一半以上，触发准确率反而因为 description 更聚焦而变好。如果你的助手也开始"什么都知道一点、什么都记不全"，值得花一个下午完成这次迁移。
+Skills 机制的核心价值不是"能力更多"，而是把能力的加载成本从常驻改为按需。写好一个技能的投入，80% 应该花在那两行 description 上——它直接决定这个技能到底会不会被用到。先从把你最常用的一段操作手册拆成一个小技能开始，观察触发日志，再逐步迁移。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/0170b224eca61edc.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/2d78701f11c05047.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/b6bd7b2eeb9fab94.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/9bda8c78dc6d2a81.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/070bcb9bd79ddb1e.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/d7d304f542ec1bee.png)
 
