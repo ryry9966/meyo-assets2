@@ -1,57 +1,62 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 38476
+feedId: 38479
 source: 综合讨论
 publishedAt: 2026-09-22
 ---
 
 ## 背景
 
-OpenClaw 的 Agent 默认带 shell 和文件读写工具，能自己执行命令、批量改文件。能力越大，翻车成本越高：一次路径幻觉、一个写错的 glob，`rm -rf` 就可能落在真实目录上。OpenClaw 在设计上把"Agent 一定会犯错"当作前提，而不是靠提示词求它别删。
+OpenClaw 的 Agent 默认带执行能力：文件读写、shell、MCP 插件调用。社区里被问得最多的一句话是："让它帮我整理目录，会不会把整个 `~/Documents` 删了？"这个问题的答案不在 prompt 里，而在 sandbox 的执行层设计。
 
-## 问题：单层拦截不可靠
+## 问题
 
-只在 system prompt 里写"不要删文件"是不够的——模型会被长上下文带偏，也可能在多步任务里自己"推理"出删除是合理的。反过来，只上容器隔离又会挡住大量合法操作。OpenClaw 的答案是分层，任何一层失守，下一层兜底：
+LLM 的输出天然不可靠：路径幻觉、相对/绝对路径混用、把"清理临时文件"理解成无差别删除。靠 system prompt 写"请小心操作"没有任何强制力——模型可能听，也可能不听。所以 OpenClaw 的思路是：**不让危险路径有机会到达执行点**，而不是指望模型自觉。
 
-### 1. 工作区根目录（workspace root）
-每个会话绑定一个 workspace，文件工具的相对路径都解析到这个根下。越界路径——绝对路径、`../` 逃逸、指向外部的 symlink——在 canonicalize 之后统一拒绝。
+## 做法
 
-### 2. 进程级沙箱
-Agent 执行环境跑在受限容器里：宿主目录以只读方式挂载，可写面只有 workspace 和 tmp。即使模型真的输出了 `rm -rf ~/projects`，写操作在文件系统层就直接失败。
+OpenClaw 的 sandbox 大致分四层：
 
-### 3. 工具与命令策略
-危险模式（workspace 外的删除、`chmod 777`、`mkfs`、`dd` 等）在工具入口被模式匹配拦截；删除类操作默认进回收站目录而非直接 unlink，保留可恢复性。
+1. **Workspace Root（根边界）**：Agent 能触达的文件系统被限定在 workspace 目录内。所有工具调用里的路径先做 canonicalize（解析 `..`、软链接），解析结果必须落在 root 内，否则直接拒绝，根本不会进入执行环节。
+2. **能力分级**：读操作默认放行；写和删走 capability token，每个 MCP server 启动时声明 scopes（`fs:read` / `fs:write` / `fs:delete`）。删除是独立 scope，默认不授予。
+3. **变更前置**：删除/覆盖前先生成 plan（源路径、目标、diff），按策略分流——白名单目录内自动通过，root 外或不可逆操作必须人工 confirm；同时自动打一个 git snapshot 作回滚点。
+4. **网关统一校验**：即使插件自己实现了 delete，请求也要过网关做同样的路径校验，插件无法绕过。
 
-### 4. 审批与审计
-workspace 外的写/删需要人工确认；所有文件操作落审计日志（时间、路径、来源工具），事后可以 diff 回放。
+最小配置示例：
+
+```yaml
+sandbox:
+  root: ~/openclaw-workspace
+  allow: [fs:read, fs:write]
+  require_confirm: [fs:delete]
+  snapshot: git
+```
 
 ## 踩坑点
 
-- **symlink 逃逸**：Agent 在 workspace 内创建指向 `/` 的软链再对它写入。校验必须在 canonicalize 之后做，看原始路径没用。
-- **MCP/插件绕过**：外部 MCP server 如果跑在沙箱外，它的文件工具不走这套策略。插件要么进同一个沙箱，要么单独授权。
-- **shell 先展开 glob**：`rm -rf *` 展开后拦截器看到的是具体路径列表，模式匹配形同虚设。拦截要在 exec 前做，或只放行白名单命令。
-- **审批疲劳**：弹窗太频繁，人会无脑点确认。高频安全操作进白名单，只对真正越界的留审批。
-- **挂载误配**：把宿主 home 以读写挂进容器，等于沙箱白做。这类问题上线前测不出来，要用 canary 文件验。
+- **软链接逃逸**：workspace 里 `ln -s` 到 home 目录，如果先校验再 resolve 就会被穿透。务必 resolve 完再判前缀。
+- **路径规范化差异**：macOS 文件系统大小写不敏感，`Docs/` 和 `docs/` 的判定可能不一致；尾随斜杠也要统一处理。
+- **插件直连系统 API**：走网关的 fs 调用没问题，但插件自己 spawn 子进程执行 shell 就绕过了校验。建议把插件进程放进容器跑。
+- **snapshot 未启用**：目录不是 git 仓库时回滚策略失效，这种情况下删除类操作应强制升级为人工 confirm。
 
 ## 可复用建议
 
-1. **默认拒绝、显式允许**：先给最小权限，缺什么加什么，不要反过来。
-2. **一个项目一个 workspace**，避免跨项目误伤。
-3. **删除永远进回收站**，保留若干天再清理。
-4. **canary 回归测试**：在敏感位置放标记文件，每次升级后验证 Agent 碰不到，纳入 CI。
-5. **审计日志接 diff**：人工只看"变了什么"，不逐条翻日志。
+- 默认 deny，按需开 scope，别图省事直接给 `fs:delete`。
+- 删除永远走四步：plan → confirm → snapshot → execute。
+- 校验逻辑放执行层，不要放在 prompt 里。
+- 定期跑红队用例：故意让 Agent 尝试删除 workspace 外的文件，验证边界是否真的拦得住。
 
 ## 总结
 
-OpenClaw 不指望模型永远不犯错，而是让犯错的代价可控：路径收敛在工作区、写操作被沙箱限制、删除可恢复、越界要审批、全程有日志。提示词约束只是体验优化，沙箱才是真正的安全边界。跑自动化任务之前，先花十分钟检查自己的挂载配置和插件沙箱状态——大多数事故的开头都是一句"我以为它默认是安全的"。
+"Agent 不会误删"不是因为模型乖，而是系统在兜底。OpenClaw 的做法是把安全从 prompt 下沉到执行层：根边界圈住活动范围，能力分级限制危险操作，变更前置提供反悔机会，网关校验保证插件也守规矩。模型可以犯错，但错误路径到不了不该到的地方——这才是自动化敢放开手脚跑的前提。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/4848c6ee36ea9fdd.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/176cc3942c32997f.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/bf888febc276225c.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/fa29f1339913b592.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/b42ff373a639da26.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/9730ff9f7c863318.png)
 
