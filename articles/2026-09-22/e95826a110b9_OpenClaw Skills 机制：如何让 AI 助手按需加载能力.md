@@ -1,50 +1,52 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 38491
+feedId: 38516
 source: 综合讨论
 publishedAt: 2026-09-22
 ---
 
 ## 背景
 
-Agent 框架最常见的问题就是上下文膨胀：为了让助手"什么都会"，把所有工具说明、操作手册、领域知识一股脑塞进 system prompt。结果上下文动辄几万 token，模型注意力被稀释，真正用到的能力不到一成，而且每轮对话都在为闲置内容付费。
+OpenClaw 的 Skills 是一种把"能力"从常驻上下文里拆出去的机制。一个 Skill 本质上是一个目录，核心是带 YAML frontmatter 的 SKILL.md：`name` 和 `description` 常驻系统提示，正文、参考文档、脚本全部懒加载。这是典型的渐进式披露设计——模型先看到目录，需要时再翻详情页。
 
-OpenClaw 的 Skills 机制用"渐进式披露"（progressive disclosure）来解决这个问题：会话启动时只注入每个技能的元数据（name + description，各一行），完整的 SKILL.md 正文只有当模型判断当前任务相关时才会读取。本质上是把能力说明书从常驻内存改成了按需分页。
+## 问题
+
+不拆的代价很直接。我们在一个接了七八个 MCP server 的实例上做过对比：全部工具定义注入后，每次请求固定多出上万 token；更糟的是，工具多了之后模型选错工具的概率明显上升——路由靠语义匹配，候选越多越容易撞车。把稳定流程固化成 Skill 之后，模型只需判断"该不该启用某个能力"，而不是在几十个 function schema 里做选择题。
 
 ## 做法
 
-1. **建目录。** 每个技能一个独立目录，入口固定是 `SKILL.md`，放在 agent workspace 的 skills 目录下。
-2. **写 frontmatter。** 关键字段只有 `name` 和 `description`。description 是模型决定"要不要加载"的唯一依据，必须写成触发条件的描述，而不是功能宣传。例如："use when the user asks to export weekly reports to Excel, generate xlsx files, or format spreadsheets"——具体动词、具体产物、具体文件类型。
-3. **写正文。** SKILL.md 正文控制在 200 行以内，只写模型不知道的事：本项目的路径约定、命令用法、边界条件。模型已知的通用知识不要重复。
-4. **挂辅助文件。** 确定性操作写成脚本（如 `scripts/export.py`），正文里只写"何时调用、参数含义"。大段参考资料放 `references/`，正文指引模型按需读取。
-5. **重启验证。** 用一句明显触发该技能的话测试，看日志确认 SKILL.md 是被触发后才读取的，而不是启动时全量加载。
+1. **建目录**：一个 Skill 一个目录，放 SKILL.md，可附 `scripts/` 与 `references/`。
+2. **写 frontmatter**：`name` 用短横线命名；`description` 写成触发条件，"Use when the user asks to ..."；正文写操作步骤、参数说明、边界情况。
+3. **确定性步骤下沉到脚本**：SKILL.md 只写"何时调用、如何传参"，具体执行交给脚本，避免模型每步重新发挥。
+4. **长资料外置**：大段参考内容拆到 `references/`，正文以相对路径引用，模型按需读取，不进初始上下文。
+5. **验证**：启动后问模型"你现在有哪些能力"，确认只有元数据被加载；再跑一次实际任务，确认正文是按需进入上下文的。
 
 ## 踩坑点
 
-- **description 写成营销文案。**"强大的 Excel 处理技能"不会触发任何东西；"export xlsx / pivot table" 才会。
-- **把全部逻辑塞进 frontmatter。** 元数据是每轮对话的常驻成本，塞得越多亏得越多。
-- **一个技能干三件事。** 触发条件混在一起，模型要么全加载要么不加载，拆成三个小技能命中率更高。
-- **脚本路径写死。** 绝对路径换台机器就失效，用相对 workspace 的路径，并确认可执行权限。
-- **技能数量失控。** 几十个技能的元数据本身就是一份不小的索引，定期删掉三个月没触发过的。
+- **description 写成功能清单而非触发条件**，模型永远想不起来用。改成"when to use"句式，把用户可能说出的关键词写进去。
+- **Skill 之间职责重叠**，description 互相抢触发。一个 Skill 只解决一类问题，宁可拆细。
+- **把所有内容塞进正文**，等于换个地方污染上下文。正文控制在几百行内，长资料外置。
+- **前置条件没声明**：脚本依赖的 CLI、环境变量，必须在正文开头写清检查方式，否则模型跑到一半才报错。
+- **脚本里硬编码密钥**：Skill 目录会进版本库，凭据一律走环境变量或 secret 管理。
 
 ## 可复用建议
 
-- description 模板："use when \<具体场景\>, involving \<具体文件/命令/产物\>"。
-- 能用脚本表达的不要用自然语言描述，脚本是零歧义的。
-- 把 skills 目录放进 git，改动走 commit，可回溯、可回滚。
-- 排查"技能不触发"时，先看日志里模型实际看到的元数据列表——多数情况是 description 没写对，而不是机制坏了。
+- 把"每次都要口头交代一遍"的重复流程做成 Skill，这是收益最高的一类。
+- description 当检索 query 写，别当广告词写。
+- 用 git 管理技能目录，改动可回溯；团队共享前先在隔离实例验证。
+- 定期审查触发记录，长期不被触发的 Skill 要么重写 description，要么删掉。
 
 ## 总结
 
-Skills 机制的核心价值不是"能力更多"，而是把能力的加载成本从常驻改为按需。写好一个技能的投入，80% 应该花在那两行 description 上——它直接决定这个技能到底会不会被用到。先从把你最常用的一段操作手册拆成一个小技能开始，观察触发日志，再逐步迁移。
+Skills 的价值不在"多"，在"准"：常驻的只有一行元数据，加载的永远是当下需要的那一份。写好一个 Skill，一半工作量在 description 的触发条件上，另一半在把模糊流程改写成可执行步骤。建议先从一两个高频流程试起，比一次搬几十个脚本有效得多。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/2d78701f11c05047.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/73f7935a34475855.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/9bda8c78dc6d2a81.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/8b2c53053491c0a3.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/d7d304f542ec1bee.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-22/eafd8b3e8855db57.png)
 
