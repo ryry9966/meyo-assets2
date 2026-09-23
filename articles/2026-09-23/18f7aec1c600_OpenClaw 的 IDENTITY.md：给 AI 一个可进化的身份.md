@@ -1,77 +1,67 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 38622
+feedId: 38641
 source: 综合讨论
 publishedAt: 2026-09-23
 ---
 
-# OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-
 ## 背景
 
-OpenClaw 的 workspace 里有几个不起眼的小文件：AGENTS.md 管操作规范，SOUL.md 管性格底色，而 IDENTITY.md 回答的是最基础的问题——"我是谁"。名字、形象、emoji、头像，加上你自己扩展的边界与口径。文件通常只有十几行，但它会被注入每次会话的上下文，本质上是身份层的"配置文件"。
+OpenClaw 的 workspace 里有几个约定俗成的 markdown：`AGENTS.md` 管行为守则，`SOUL.md` 管价值观，`USER.md` 管用户是谁，而 `IDENTITY.md` 管"我是谁"。它默认只有几行——名字、物种、vibe、emoji、头像——每次会话开始时被注入 system prompt。文件很小，作用不小：它决定了同一个 agent 在不同会话、不同频道里表现出的连续性。
 
 ## 问题
 
-很多人默认 agent 的自我描述散落在各处：系统提示词里写一句，某个插件里写一句，聊天中口头纠正一句。结果是：
+没写或随手写的后果很具体：
 
-- 同一个助手今天自称 A，重启后口径又变了；
-- 多 agent 场景下互相串人格；
-- 想调整语气或边界时，找不到该改哪一行。
+- **人格随机**：今天话痨明天冷淡，跨会话没有连贯性；
+- **多 agent 撞脸**：两个助手都叫 Assistant，群聊里分不清谁在说话；
+- **改人格只能动全局 prompt**，牵一发动全身，改完还得重启会话验证。
 
-长期跑下来你会发现，行为不可控的根因往往不是模型能力，而是身份定义从未被当作一个可管理的资产。
+本质上，"这个 agent 是谁"没有被当成一个可管理的资产，而是散落在 prompt 里的临时台词。
 
 ## 做法
 
-**第一步，定位文件。** 默认在 workspace 根目录（`~/openclaw/workspace/IDENTITY.md`）。多 agent 时每个 workspace 各一份，不要共享。
-
-**第二步，写最小版本：**
+1. **定位文件**。单 agent 默认在 `~/.openclaw/workspace/IDENTITY.md`；多 agent 时每个 workspace 一份，天然隔离。没有就新建。
+2. **最小模板起步**：
 
 ```markdown
-# IDENTITY.md
-- **Name:** 小爪
-- **Creature:** 一只务实的机械猫，回答简短、工程化
-- **Emoji:** 🐾
-- **Avatar:** avatars/claw.png
-
-## 边界
-- 不确定就先问，不编造
-- 删除、支付类操作必须二次确认
-
-## 口径
-- 中文回复，技术名词保留英文
+# IDENTITY
+- Name: 小螺
+- Creature: 住在终端里的机械蜗牛
+- Vibe: 冷静、话少、先给结论
+- Emoji: 🐌
+- Avatar: assets/snail.png
 ```
 
-**第三步，纳入 git。** 每次修改一次 commit，message 写清动机——"为什么改"比"改了什么"重要。
-
-**第四步，建立进化机制。** agent 可以起草 diff（"最近确认太啰嗦，建议把边界第 2 条改成……"），但合并权在人。每月或一个大版本后统一 review，而不是随手热改。
+3. **加两段自定义**：语气边界（什么场合不开玩笑、哪些频道可以放松）和表达偏好（列表优先、改代码先给 diff）。
+4. **让它进化**：文件尾加 `## Changelog`。每周让 agent 复盘近期对话，回答"哪句话不像我"，把修正写成一行追加进去。也可以让 agent 自己起草初版，你只做编辑。
+5. **用 git 管 workspace**：改身份 = 改文件 = 提交 diff，人看一眼再合入。新人格先丢到测试频道跑两三天，观察语气再定稿。
 
 ## 踩坑点
 
-1. **写成简历或营销文案。** 三百字的"使命愿景"会稀释注意力，行为反而漂移。30 行以内是经验值。
-2. **职责重叠。** 身份文件里写工具用法、AGENTS.md 里写人设，三处描述同一件事，改一处忘两处。原则：IDENTITY.md 只回答"我是谁、边界在哪"，操作流程归 AGENTS.md 和 TOOLS.md。
-3. **无人审查的自我进化。** 让 agent 自主改身份而不 review，一次失败的自我总结就可能固化成错误人格。
-4. **只换 emoji 和头像就当完成"身份升级"。** 视觉身份是表层，行为身份（边界、口径、确认规则）才是大头。
-5. **多 agent 用错 workspace 路径。** 身份串门，排查半天才发现读的是隔壁的文件。
+- **别写长**。IDENTITY.md 每个会话都吃 token，控制在 30 行以内。形容词堆砌不如行为描述："回复不超过三句"比"简洁高效"管用。
+- **别越界**。价值观归 `SOUL.md`，用户偏好归 `USER.md`，`IDENTITY.md` 只管身份。内容重叠时模型会在冲突处随机选边，表现就是"人格不稳定"。
+- **别开放无监督自改**。自改必须落到 changelog + git diff，人工过目再提交，否则一两周后它可能给自己加戏成"赛博诗人"，而且你查不到是哪次改的。
+- **小字段有大气场**：换 emoji 之后语气确实变了——可能是巧合，但这类小字段值得当成实验变量来对待。
 
 ## 可复用建议
 
-- 把身份当代码管理：小步提交、可回滚、有历史可查。
-- 排障顺序固定：agent 行为异常时，先问"是工具问题，还是身份模糊？"再看日志。
-- 给 agent"提议权"而非"修改权"，这是安全与进化的平衡点。
-- 换模型或升版本后，重读一遍 IDENTITY.md——不同模型对同一段人设的服从度不同，常需要微调。
+- 身份当代码：有版本、有 review、有回滚；
+- 行为描述 > 形容词；
+- 每月做一次身份 retro，让 agent 参与定义自己，但决定权在你手里；
+- 多 agent 场景靠 workspace 文件区分身份，别靠 prompt 里喊"你是二号助手"。
 
 ## 总结
 
-IDENTITY.md 的价值不在文件本身，而在于它把"AI 是谁"从口口相传变成了版本化的配置：小、可 diff、可回滚、可复盘。这正是长期运行的 agent 能保持行为一致又持续进化的朴素基础。如果你还没动过这个文件，建议今天花十分钟写一版，跑两周再看。
+`IDENTITY.md` 把"agent 是谁"从 prompt 里一句临时台词，变成了 workspace 里有版本、可 review、可回滚的资产。身份不是一次性的出厂设置，而是和 agent 相处过程中慢慢攒出来的东西——这也正是它值得用工程方法去维护的原因。从一个五行的模板开始，比想象中容易。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/4e16e62a2da5f98a.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/67694b95fad883e1.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/3911d4fb197caa1e.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/5df229726adb1ee0.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/1b6705cfa3e2f03c.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/fad93b693e6944db.png)
 
