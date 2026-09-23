@@ -1,77 +1,71 @@
 ---
 title: OpenClaw Skills 机制：让 AI 助手按需加载能力
-feedId: 38618
+feedId: 38648
 source: 综合讨论
 publishedAt: 2026-09-23
 ---
 
 ## 背景
 
-跑 agent 时间长了都会遇到同一个问题：能力越堆越多，system prompt 越来越长。把所有工具说明、操作流程全量塞进上下文，代价是三重的——token 费用上涨、模型注意力被稀释、不该触发的流程反而被误触发。OpenClaw 的 Skills 机制针对的就是这个矛盾：采用渐进式披露（progressive disclosure）的思路，启动时只注入每个技能的名称和一句话描述，正文等到模型判断"用得上"时才读取。
+用 OpenClaw 做日常自动化的人迟早会撞上同一个矛盾：希望助手什么都懂，又不希望 system prompt 膨胀到失控。我早期把所有操作规范、工具说明全塞进 AGENTS.md，结果上下文常驻几万 token，模型反而开始“选择性失忆”——指令越多，单条指令的权重越低。
+
+Skills 是 OpenClaw 给出的答案：把“能力”拆成独立目录，常驻上下文的只有一行 description，正文按需加载。
 
 ## 问题
 
-具体一点：假设你给助手配了工单分诊、日报生成、服务器巡检、天气查询等十几个流程。全量注入时，每次对话都背着几千字操作手册，模型经常在"该查工单"和"该巡检"之间选错；而如果干脆不注入，模型根本不知道自己有这些能力。这是一个典型的检索问题，不该靠堆上下文硬扛。
+核心是两点：
+
+1. **上下文经济学**：全量注入贵且稀释注意力；按需加载省 token，但依赖模型自己判断“要不要读”，判断错了，这个能力就等于不存在。
+2. **Skills 与 MCP 工具的边界**：MCP 提供工具 schema（连接后常驻），Skills 提供程序性知识（流程、禁忌、输出格式）。搞混了就会出现“有工具没章法”或“有章法没工具”。
 
 ## 做法
 
-Skills 在 OpenClaw 里就是一个文件夹约定。在 workspace 下建：
+最小可用的 Skill 就是一层目录：
 
 ```
-skills/
-  incident-triage/
-    SKILL.md
-    scripts/triage.sh
-    references/runbook.md
+~/.openclaw/workspace/skills/
+└── weekly-report/
+    └── SKILL.md
 ```
 
-`SKILL.md` 分两部分。frontmatter 是给元数据解析器看的：
+SKILL.md 分两段：frontmatter 的 `name` + `description` 常驻 system prompt，下面的 markdown 正文只在模型判断相关时通过 read 工具加载。我是按这个顺序写的：
 
-```yaml
----
-name: incident-triage
-description: 做告警的初步分诊；用户提到告警、故障、线上问题时使用
-metadata:
-  requires:
-    bins: [kubectl]
----
-```
+1. **先审计**：翻聊天记录，找“反复口述同一套流程”的场景。我的第一个 Skill 是周报生成，因为每周都要重申一遍格式。
+2. **description 写成路由键**：触发条件 + 做什么 + 边界。例如“当用户要求生成周报或汇总本周提交时使用；不负责数据分析本身”。
+3. **正文写成操作规程**：步骤、确认点、失败兜底，而不是功能介绍。依赖外部 CLI 的在 frontmatter 里声明 requires，缺依赖时直接标为不可用，比运行时报错体面。
+4. **重内容外置**：模板、清单放到同目录附加文件，SKILL.md 里只写“需要时读取 report-template.md”。
+5. **验证**：问一个应该触发的问题，看 gateway 日志确认有没有去读文件。没触发就改 description，触发太频繁就收窄措辞。
 
-正文是给模型看的，建议固定四段：何时使用、何时不用、输入输出、步骤与失败处理。
-
-关键在于加载顺序：会话启动时，gateway 只把 name + description 拼进上下文；模型判断相关后，通过 skills 工具读取 `SKILL.md` 拿到完整正文；`references/` 下的长文档再按需读。三层结构，逐层加载。
-
-落地步骤：
-
-1. 挑一个高频、流程稳定的任务做成第一个 skill，别一上来就搬全部；
-2. description 写触发条件，不写功能介绍（下面细说）；
-3. 确定性操作落成 `scripts/` 里的脚本，`SKILL.md` 只写调用方式；
-4. 重启 gateway，开新会话让 agent 列出可用技能，确认识别；
-5. 跑三组测试：无关请求不触发、相关请求必触发、触发后一次做对。
+装第三方的用 `clawbed skills list` / `clawbed skills install`，装完先通读一遍 SKILL.md 再留——社区 Skill 质量差异很大。
 
 ## 踩坑点
 
-- **description 写成产品文案**。"强大的工单分析工具"这种描述，模型无法判断何时该用。要写成"用户提到告警、故障、服务不可用时使用"——这段话是模型做加载决策的唯一依据。
-- **正文太长**。`SKILL.md` 写到几千字，加载一次就把按需加载省下的 token 吐回去了。正文几百字封顶，细节进 `references/`。
-- **requires 校验的是宿主环境**。bins 检查的是 PATH；如果实际执行在容器或远程机里，技能会被判定不可用而隐藏，排查时先看执行环境。
-- **改了不生效**。元数据在会话启动时注入，改完 `SKILL.md` 必须开新会话验证，别在旧会话里反复调。
-- **技能互相抢触发**。两个技能描述高度重叠时，模型的选择接近随机。主动错开措辞，或在正文里写清"何时不用本技能"。
+- description 写成“帮助处理数据相关任务”这种话，永远不会触发——模型路由完全依赖这段话里的关键词。
+- 反过来堆太多触发词，模型什么都往这个 Skill 上靠，白白加载。
+- 正文写太长。见过 300 行的 SKILL.md，按需加载变成了按需爆炸，尽量单屏以内，超出就拆文件。
+- 两个 Skill 职责重叠，模型选错的概率随重叠度上升，宁可合并。
+- 把 API key 写进 SKILL.md——正文会进上下文，密钥只放环境变量或配置。
+- 误以为 Skill 能赋予新能力。它不能让模型调用不存在的工具，只能规范已有工具的使用方式。
 
 ## 可复用建议
 
-把 skill 当"操作手册"而不是"功能插件"：一个 skill 对应一类可复现的任务，而不是一个 API 封装。description 用固定模板——"做 X；当用户提到 Y 时使用"。skills 目录进 git，改动可回滚、可分享给团队复用。能用脚本表达的就别用自然语言步骤：模型的自由发挥空间越小，输出越稳定。
+- description 公式：**when（何时）+ what（做什么）+ not（不做什么）**，三段缺一不可。
+- 一个 Skill 只干一件事：description 里如果用“和”连接了两个不同场景，考虑拆开。
+- Skills 目录进 git，跟 workspace 一起版本化，改坏能回滚。
+- 定期数一下所有 description 的常驻 token 成本——十几个 Skill 也可能吃掉上千 token。
+- 必须 100% 执行的固定流程（每日备份之类）别指望 Skill 的概率性触发，用 cron / heartbeat 更可靠。
 
 ## 总结
 
-Skills 的本质，是把 prompt 工程从"维护一个越来越大的 system prompt"变成"维护一组按文件组织、按需检索的操作手册"。省 token 只是副产品，真正的收益是能力可测试、可版本化、可独立演进。建议从今天最常重复口头交代给助手的那个流程开始，把它做成你的第一个 skill。
+Skills 的本质，是用一行 description 换取一次上下文加载的决策权。它不是插件系统，更像一套提示词的分发协议：常驻的尽量短，加载的尽量准。把 Skill 当成“给未来某次对话预存的操作手册”来写，而不是当功能开关来用，基本就不会跑偏。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/4d4309c6fcd6fa83.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/ae39bb8ad5240ed5.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/172430647ccec67e.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/140f28a703e938b7.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/8766c7d2395972a4.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-23/2a130d27904a27ed.png)
 
