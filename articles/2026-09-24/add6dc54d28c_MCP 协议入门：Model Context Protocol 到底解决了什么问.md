@@ -1,60 +1,78 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 38694
+feedId: 38761
 source: 综合讨论
 publishedAt: 2026-09-24
 ---
 
-## 背景：工具集成的 M×N 问题
+## 背景
 
-写 Agent 的人大多经历过这样的循环：想让它读 GitHub issue，写一份 function calling 适配；想查数据库，再写一份；换个模型或框架，格式不同，胶水代码重写一遍。N 个应用乘 M 个数据源，集成成本是乘法关系。MCP（Model Context Protocol）就是针对这个乘法问题提出的开放协议——把"模型如何发现并调用外部能力"标准化，把 M×N 变成 M+N。
+过去一年做 Agent 自动化，最耗时间的往往不是提示词调优，而是“接线”：让模型能读本地文件、查数据库、调内部 API。每个宿主环境——IDE 插件、桌面客户端、自研 Agent 框架——都各自实现一套工具调用格式，互不兼容。同一个 GitHub 工具，在 A 框架写一遍适配器，换到 B 客户端还得再写一遍。
 
-## MCP 到底是什么
+## 问题：M×N 集成困境
 
-一句话概括：MCP 定义了 Host（Agent 运行时）、Client、Server 三方的通信规范。Host 内嵌 Client，通过统一协议连接一个或多个 MCP Server；每个 Server 封装一类能力，对外暴露三种原语：
+把问题抽象一下：M 个 AI 应用要接 N 个数据源/工具，最坏情况要维护 M×N 份胶水代码。工具方被迫为每个客户端出 SDK，客户端被迫为每个工具写适配，能力无法沉淀复用，权限管控也没有统一入口。
 
-- **Tools**：可被模型调用的操作，如创建 PR、执行查询
-- **Resources**：可被读取的数据，如文件内容、表结构
-- **Prompts**：预置的提示模板
+MCP（Model Context Protocol）做的事就一件：把 M×N 压缩成 M+N。应用侧实现一次 Client，工具侧实现一次 Server，中间用标准协议对话。
 
-传输层支持 stdio（本地子进程）和 streamable HTTP（远程服务）。OpenClaw 这类运行时扮演 Host 角色，接入成本集中在配置 Client 和挑选 Server 上。
+## 核心概念与上手步骤
 
-## 接入步骤（以本地 stdio 为例）
+MCP 的架构分三个角色：
 
-1. **选 Server**：从官方和社区仓库里挑，优先选择维护活跃、提供只读模式的。
-2. **注册配置**：在 OpenClaw 的 MCP 配置段声明 server 启动命令、参数、环境变量，并设置权限白名单。
-3. **启动握手**：拉起子进程，确认 initialize 握手成功，列出 tools 和 resources。
-4. **冒烟测试**：用一条明确指令触发一次调用，核对入参出参是否符合 schema。
-5. **收敛权限**：确认默认拒绝写操作，敏感目录和凭证不要进环境变量。
+- **Host**：模型运行的环境，比如桌面客户端、IDE、你自己的 Agent
+- **Client**：Host 内部组件，负责和一个 Server 保持连接
+- **Server**：暴露能力的服务，通常是一个独立进程
 
-远程场景只需把第 2 步换成 endpoint 加鉴权配置，其余流程一致。
+Server 通过三类原语暴露能力：**Tools**（模型可调用的动作）、**Resources**（可读取的上下文数据）、**Prompts**（预置提示模板）。消息层是 JSON-RPC 2.0，本地进程走 stdio 传输，远程服务走 Streamable HTTP。
 
-## 踩坑记录
+上手四步：
 
-- **工具描述质量决定调用准确率**。Schema 里 description 含糊，模型就会乱传参或选错工具。自己写 server 时，把参数约束写进 description 和 enum，比事后改 prompt 有效得多。
-- **工具不是越多越好**。挂 30 个工具，上下文占用膨胀，模型的选择开始漂移。按任务场景分组启用，而不是全量挂载。
-- **stdio 的进程生命周期**。Server 随 Host 启停，调试时它的 stderr 常常混进主日志，定位问题前先分离日志流。
-- **版本兼容**。协议在演进，Client 与 Server 版本差距大时，轻则能力静默降级，重则握手失败。升级后务必重跑冒烟测试。
-- **权限治理**。一个带写权限的 MCP Server 约等于交出一部分 shell，生产环境坚持最小权限加调用审计。
+1. 用官方 SDK（TypeScript/Python）起一个 Server 项目
+2. 定义工具的输入 schema 和描述
+3. 注册 handler，本地跑通
+4. 在 Host 的配置文件里挂载 Server 命令，重启验证调用链
+
+一个最小示例（Python）：
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("fs-tools")
+
+@mcp.tool()
+def list_dir(path: str) -> list[str]:
+    """列出指定目录下的文件名"""
+    return os.listdir(path)
+
+mcp.run(transport="stdio")
+```
+
+## 踩坑点
+
+1. **stdio 传输下别往 stdout 打日志**。stdout 是协议通道，print 一句调试信息整条消息流就废了，日志一律走 stderr。
+2. **工具描述是给模型看的接口文档**。写得含糊，模型要么不调、要么传错参数。`list_dir` 比 `handle_path` 好用得多。
+3. **工具数量会撑爆上下文**。挂 20 个 Server 每个十几个工具，光 schema 就占掉大半窗口，按需启用。
+4. **能力即风险**。Server 给了模型什么，模型就能做什么：路径加白名单、默认只读、密钥走环境变量，别图省事。
+5. **提示注入**。外部数据经 Resources 进入上下文时可能夹带恶意指令，敏感操作务必要求人工确认。
 
 ## 可复用建议
 
-- 接入顺序：先 resources（只读），后 tools（可写），逐步放开。
-- 每个 server 配一份最小冒烟脚本，纳入 CI 或升级检查清单。
-- 多 server 并存时给工具名加前缀，避免同名冲突。
-- 记录每次 tool call 的入参、出参、耗时——排查"模型为什么调错"时全靠这份日志。
+- **先判断值不值**：单一宿主 + 一两个工具，直接写 function calling 更简单；只有需要跨多个宿主复用时，MCP 的标准化才划算。
+- **一个 Server 只管一个领域**，细粒度组合优于大而全。
+- **命名加前缀避免冲突**，schema 字段少而明确。
+- **Server 侧记录调用日志**，出问题时能回放排障。
 
 ## 总结
 
-MCP 解决的不是"模型不够聪明"，而是集成的工程问题：统一了能力发现、描述与调用的协议层。它最大的收益是复用——工具写一次，任何兼容的 Host 都能挂载。但协议本身不负责权限边界和 server 质量，这两块仍是接入方自己的功课。对 OpenClaw 用户的务实路径是：从一两个只读 server 开始跑通全链路，验证日志与权限行为，再逐步扩展到写操作和远程部署。
+MCP 没有任何魔法，它解决的就是集成成本问题：用一层标准协议，把“模型怎么用工具”和“工具怎么实现”解耦。理解了这一点，就知道什么时候该用它、什么时候一个普通函数就够了。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/286f6e89b571384c.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/08e00449c65e119a.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/29b3ffa8283f0f4b.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/065f4703b2429073.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/f722184b38634ddd.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/8e64514970557628.png)
 
