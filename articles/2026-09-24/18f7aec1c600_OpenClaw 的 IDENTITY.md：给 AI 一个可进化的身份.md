@@ -1,70 +1,55 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 38766
+feedId: 38769
 source: 综合讨论
 publishedAt: 2026-09-24
 ---
 
 ## 背景
 
-OpenClaw 的 agent 行为不是写死在代码里的。它的工作区（workspace）里放着一组 Markdown 文件——SOUL.md、USER.md、TOOLS.md、MEMORY.md 等——会话启动时注入 system prompt。其中 `IDENTITY.md` 负责回答一个问题：**这个 agent 是谁**。名字、气质、边界、自我描述，全在这一个文件里。
+OpenClaw 的 workspace 里，几个 Markdown 文件各司其职：SOUL.md 管行为与性格，USER.md 存用户画像，而 IDENTITY.md 管的是"这个 agent 是谁"——名字、形象原型、emoji、头像、主题色。文件很小，每次会话启动时随 workspace 注入上下文，决定了 agent 在对话里如何称呼自己、在群聊和不同渠道里如何被呈现。
 
 ## 问题
 
-没有身份文件时，实践中常见三种症状：
+不配置 IDENTITY.md 时，实践中常见三类问题：
 
-1. **语气漂移**。同一个 agent，周一正经周三贫嘴，跨会话没有人格一致性；
-2. **多 agent 串味**。跑了两三个 bot 分管不同事务，用户分不清谁是谁，回复风格互相污染；
-3. **修改成本高**。身份写死在部署配置里，改一句话要重新发版，非工程同学无法参与。
+1. **自我指称不一致**：新会话里自称 A，上下文压缩后自称 B，看起来像中途换了人。
+2. **多实例混淆**：同时跑"工作助手"和"家庭运维"两个 agent，群聊里分不清谁在说话。
+3. **跨渠道呈现漂移**：没有固定头像和主题色，同一个 agent 在不同客户端看起来完全不同。
 
 ## 做法
 
-以默认工作区为例，没有就手动建一个：
-
-```markdown
-# IDENTITY.md
-- **Name:** Atlas
-- **Creature:** 冷静的运维型助理
-- **Vibe:** 简洁、直接、不寒暄
-- **Emoji:** 🛠️
-
-## 边界
-- 不替用户执行不可逆操作（删除、对外发送）
-- 被追问身份时如实说明自己是 agent
-```
-
-推荐五步走：
-
-1. **最小集起步**：名字 + 一句话气质 + 三条边界，先跑起来再说；
-2. **控制长度**：全文压在一屏内。它每次会话都进上下文，写长了持续烧 token，还会稀释其他指令；
-3. **版本化**：把工作区放进 git，身份变更走 commit，可回滚、可追溯；
-4. **验证生效**：改完**新开会话**测试，问它"你是谁、什么风格"。正在跑的会话里旧身份还驻留在上下文里，不会立刻变；
-5. **进化闭环**：遇到不满意回复，先判断是身份问题还是记忆/工具问题，只有前者才改 IDENTITY.md，别把所有毛病都塞进身份文件。
+1. 定位 workspace（默认 `~/.openclaw/workspace/`），若没有 IDENTITY.md，按模板新建。
+2. 只填事实字段：`name`、`creature`、`avatar`（相对路径，图片放 workspace 内）、`theme`，再加一行 tagline 圈定职责边界，比如"负责家庭服务器与自动化脚本"。
+3. 篇幅控制在十行以内。它是每次会话的固定 token 开销，长内容应放进 SOUL.md。
+4. 开新会话验证：直接问"你是谁、负责什么"，回答应与文件一致。
+5. 多实例场景下，各 workspace 分别配置，确保名字和颜色可区分。
 
 ## 踩坑点
 
-- **和 SOUL.md 抢地盘**。SOUL 管价值观和行为准则，IDENTITY 管它是谁，USER 管用户是谁。同一规则写在两个文件里，模型会随机偏向其一。一个关注点只落在一个文件；
-- **写成小作文**。见过 2000 字的身份文件，模型抓不住重点，人也维护不动；
-- **放动态信息**。任务状态、密钥、临时偏好不该进这里——那是 MEMORY.md 和配置的事。身份是慢变量；
-- **期待确定性**。身份文件是强偏置，不是硬约束。模型升级后人格表现可能微调，关键边界要同时在 AGENTS.md 和工具权限层兜底。
+- **写太长**：IDENTITY.md 是身份事实，不是人格说明书。行为规则放 SOUL.md，两边混写容易冲突且浪费 token。
+- **措辞含糊**："你可以叫我 X"不如直接写"名字是 X"，前者在长会话中容易被稀释。
+- **头像路径**：用 workspace 内相对路径，确认 gateway 进程有读取权限；绝对路径换机器即失效。emoji 选通用字符，部分终端渲染不全。
+- **让 agent 自改身份文件**：我没开放这个权限。身份变更应走 git 提交 + 人工 review，否则某次对话里 agent"灵机一动"改了名，下次会话就被固化。
+- **workspace 被 gitignore**：很多人忘了把 workspace 纳入版本控制，迁移环境时身份文件直接丢失。
 
 ## 可复用建议
 
-- **多 agent 舰队**：做一个 base 模板（通用边界 + 语气基调），每个 agent 只覆盖名字和专长字段，用脚本批量生成各自的 IDENTITY.md；
-- **把改身份当改配置**：走 PR review，changelog 记录谁改的、为什么改；
-- **季度回顾**：对照它实际承担的角色，删掉没用的形容词，身份文件只会越写越准，前提是你肯删。
+- 把 IDENTITY.md 当 IaC 管理：提交到私有仓库，每次修改看 diff，可随时回滚。
+- 一个 agent 一套身份三件套：名字 + emoji + 主题色对齐，群聊中一眼可辨。
+- 小步进化：先起一个通用名字跑起来，等职责稳定后再补 tagline 和形象，比一开始虚构"完美人设"务实得多。
 
 ## 总结
 
-IDENTITY.md 的价值不在于让 AI"有灵魂"，而在于把原本散落在 prompt 里、靠口头约定的东西，变成一个**短小、可版本化、可审计**的文件。身份是慢变量——用管理配置的方式管理它，agent 的行为才会随时间收敛，而不是发散。
+IDENTITY.md 解决的不是能力问题，而是一致性问题。十行以内的版本化文件，换来的是自我指称稳定、多实例可辨、跨渠道呈现统一。先写最简版本，再随使用场景迭代，是成本最低、也最不容易跑偏的路径。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/70339ca9d45de40d.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/8ec0431cbf3de902.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/1f44fb485a8a1fd2.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/f4ddf6933a3a6a99.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/53f92ca2117ccb61.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-24/b656cf31aa54435f.png)
 
