@@ -1,77 +1,69 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 38917
+feedId: 38932
 source: 综合讨论
 publishedAt: 2026-09-25
 ---
 
 ## 背景
 
-OpenClaw 这类长期运行的 Agent 网关，能力来源大致分三层：模型自身的推理、MCP/CLI 等工具、以及 Skills。前两层决定"能做什么"，Skills 决定"什么时候、按什么流程做"。
+过去半年，我负责的 Agent 接入的东西越来越多：三四个 MCP server、常驻的代码规范 prompt、部署流程说明……系统提示词一路膨胀，开始出现选错工具、漏步骤的情况。把低频能力迁移到 OpenClaw 的 Skills 机制之后，这些问题有了比较干净的解法，记录一下实践。
 
-一个 Skill 本质上是一个文件夹：一份带 frontmatter 元数据的 `SKILL.md`，加上可选的脚本和资源文件。它不注册新的 API，只是给模型提供一份可读的操作手册。
+## 问题：能力常驻的代价
 
-## 问题
+把所有能力定义塞进上下文，有三个直接代价：
 
-最直觉的做法是把所有能力说明全部塞进 system prompt。能力少时没问题，攒到十几个之后会出三件事：
+1. **Token 成本线性上涨**：每个工具 schema、每段流程说明都常驻每一轮对话；
+2. **注意力被稀释**：可选项一多，模型选错工具、忽略关键约束的概率明显上升；
+3. **过程性知识无处安放**：「我们的服务怎么发布」「代码风格约定是什么」这类知识，只能靠每次会话人肉重复。
 
-- 常驻上下文 token 明显上涨，留给实际对话的空间变小；
-- 注意力被稀释，该触发的流程没触发、不该用的被误用；
-- 多份手册之间有冲突时，模型行为不稳定。
+## Skills 的做法：三层渐进式披露
 
-Skills 机制的核心思路，就是把这堆手册从"全量常驻"改成"索引常驻、正文按需"。
+一个 Skill 本质是一个目录：`SKILL.md`（含 name/description 元信息 + 操作指南正文），加可选的 `scripts/` 和 `references/`。加载分三层：
 
-## 做法与步骤
+- **L1**：只有 name + description 常驻上下文，每个技能几十 token；
+- **L2**：任务与 description 匹配时，才加载 SKILL.md 正文；
+- **L3**：正文里引用的脚本和参考文件，用到时才读取或执行。
 
-**1. 搭目录结构。** workspace 下建 `skills/` 目录，一个能力一个文件夹：
+落地四步：
+
+1. **盘点**：列出常驻 prompt 和低频工具，优先迁移「低频 + 流程性强」的能力；
+2. **拆分**：一个技能只做一件事，主文件控制在几百行内，细节移入 references；
+3. **写 description**：把它当路由键，写清楚做什么、什么场景用、触发词是什么；
+4. **验证**：用真实任务跑一遍，观察是否触发、加载到了哪一层。
 
 ```text
-skills/
-  weekly-report/
-    SKILL.md
-    scripts/render.py
+skills/pdf-report/
+  SKILL.md          # 元信息 + 精简操作步骤
+  scripts/build.py  # 按需执行，不进上下文
+  references/api.md # 模型需要时再读
 ```
-
-**2. 写好 frontmatter。** 启动时 OpenClaw 只把每个 skill 的 `name` 和 `description` 注入索引，正文不进上下文：
-
-```yaml
----
-name: weekly-report
-description: 当用户要求汇总本周消息或任务并生成周报时使用。先汇总，再运行 scripts/render.py 渲染。
----
-```
-
-**3. 把 description 当检索词写。** 用户嘴里会说出的动词、名词都要覆盖；写"何时用"，不要写"这是什么"。
-
-**4. 正文只写动作。** `SKILL.md` 用祈使句列步骤，能脚本化的步骤直接指向脚本，让模型用执行工具去跑，而不是自己逐句推理。
-
-**5. 验证闭环。** 跑一个典型请求，看日志确认三段都在：索引匹配 → 读取 `SKILL.md` → 执行步骤。缺任何一段都不算生效。
 
 ## 踩坑点
 
-- **description 含糊是最常见的失效原因。** 只写"处理报告"的 skill，既不会被"整理周报"触发，也可能在用户随口提到"报告"时抢触发。
-- **正文超过两三百行就该拆。** 加载是全量的，正文越长，单次触发的上下文成本越高。
-- **脚本依赖要前置声明。** 容器里缺某个 CLI 时，模型会反复重试、浪费轮次；在正文开头写一句前置检查能省很多麻烦。
-- **描述高度重叠的 skill 会互相抢触发**，宁可合并也不要堆叠。
+- **description 太含糊**：写过一句「处理文档」，结果从不触发。改成「将 Markdown 转为带页眉页脚的 PDF，用于周报/月报」后才稳定命中；
+- **SKILL.md 越写越长**：正文一长，L2 加载就退化成另一种常驻。细节果断外移到 references；
+- **模型不会主动读没被引用的文件**：目录里放了文件但正文没提，等于不存在，引用必须显式写进正文；
+- **过度拆分**：两个技能总是被同时触发，就该合并；
+- **和 MCP 职责混淆**：MCP 解决「连得上、拿得到数据」，Skills 解决「按什么流程做」。同一个流程在两边各写一份，更新时必然漂移，选定一处为准。
 
 ## 可复用建议
 
-- 高频重复的流程（周报、部署前检查、某类数据清洗）优先沉淀成 skill，而不是每次手贴 prompt。
-- workspace skills 进版本管理，改动走提交记录，回滚有据可查。
-- 定期看加载日志：长期没触发过的 skill，删掉或降级为普通文档。
-- 职责分层：通用工具能力交给 MCP，流程性知识交给 Skills，两层别混着写。
+- 能一条命令完成的操作，写成脚本让模型执行，比让它「读文档照做」稳定得多；
+- 把团队的部署 runbook、代码规范沉淀成 Skill，新成员环境开箱即用；
+- 迁移前后各统计一次 token 用量和触发率，用数据确认收益，别靠感觉。
 
 ## 总结
 
-Skills 机制没有黑魔法，它只是把"手册全背下来"换成了"先看目录、用哪本翻哪本"。收益来自两处：上下文成本随能力数量增长变慢，触发准确率随 description 质量上升。把 description 当检索关键词来持续维护，是这套机制能不能用好的关键。
+Skills 的价值不在于「能力更多」，而在于**上下文更省、行为更稳**：元信息常驻、正文按需、脚本隔离执行，三层结构把成本和准确性同时抬了起来。如果你的 Agent 也在被膨胀的系统提示词困扰，值得把低频能力迁一遍试试。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-25/0a8767d1c3d3ca50.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-25/294af082eeb87985.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-25/904ad1d544f34825.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-25/2b71a023064d59f9.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-25/940cf047dcdebe1b.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-25/01f28ccd8fcc3ed7.png)
 
