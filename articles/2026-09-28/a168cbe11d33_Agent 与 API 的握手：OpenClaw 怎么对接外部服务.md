@@ -1,60 +1,78 @@
 ---
 title: Agent 与 API 的握手：OpenClaw 怎么对接外部服务
-feedId: 39207
+feedId: 39285
 source: 综合讨论
 publishedAt: 2026-09-28
 ---
 
 ## 背景
 
-Agent 的能力边界，基本等于它能调通的外部服务集合。在 OpenClaw 里把 agent 装好只是第一步，真正决定它"能不能干活"的，是它与外部 API 之间那次"握手"——鉴权是否通过、参数是否对得上、出错时模型能否看懂返回。这篇帖子把最近对接几个内部服务和第三方 API 的过程整理一下，沉淀成可复用的做法。
+Agent 要产生实际价值，光会聊天不够，得能"动手"：查库存、开工单、发通知。OpenClaw 对接外部服务有三条常用路径：原生 tool calling、MCP server、插件/回调。路径不同，但本质是同一件事——**一次握手**：认证方式、参数契约、错误语义、超时与重试策略，双方都要先谈拢。很多"模型不听话"的问题，根因其实是握手没做完。
 
 ## 问题
 
-实际对接中最常见的三类失败：
+三种典型症状：
 
-1. **Agent 不知道该调哪个工具**，或传错参数——根因多半是工具描述写得含糊；
-2. **调用成功了，但把几百行原始 JSON 直接回灌上下文**，几轮对话后 token 爆掉；
-3. **出错时返回裸错误串**，模型只能瞎猜：要么机械重试，要么直接编造一个结果。
+1. **传参靠猜**：tool 描述只有一句"创建订单"，模型不知道字段单位、枚举值，只能瞎填。
+2. **错误不会处理**：服务返回 401 或 429，agent 拿到原始报错后原样重试，轻则烧 token，重则死循环。
+3. **慢接口拖全场**：一个 20 秒的同步接口把整个任务卡住，上游还以为 agent 挂了。
 
-## 做法与步骤
+## 做法
 
-**1. 选对接路径。** OpenClaw 侧有两条路：写 MCP server，或在插件里直接注册 tool。经验法则是——如果这个服务会被多个 agent、多个会话复用，走 MCP，把鉴权和配置收敛在一处；如果只是单个 agent 的私有动作，插件内注册更轻。
+按五步走：
 
-**2. 工具描述写给模型看，不是写给人看。** description 里说清三件事：什么时候该用、什么时候不该用、参数的单位与格式。比如 `date` 参数写明"YYYY-MM-DD，时区 UTC"，比只写"日期"能少一半误调用。
+**1. 先划边界。** 列出 agent 真正需要的动作清单（查询、创建、取消），不要把整套 REST API 一股脑暴露。tools 超过 20 个，选择准确率会明显下降。
 
-**3. 鉴权放适配层，不进上下文。** API key 放环境变量或配置文件，由 adapter 注入请求。任何情况下不要让 key 出现在 prompt、日志或工具返回值里。
+**2. 用 MCP 包一层薄封装。** 一个 tool 对应一个明确动作，描述写清参数含义、单位、必填项和返回结构：
 
-**4. 错误结构化。** adapter 统一包装返回：`{ ok, data, error_code, hint }`。失败时 hint 用一句话告诉模型下一步该做什么，比如"参数 city 不合法，请向用户确认城市名"。模型对可读的错误反应很好，对堆栈字符串基本无能为力。
+```python
+@mcp.tool()
+async def create_ticket(title: str, priority: Literal["low","medium","high"],
+                        idempotency_key: str):
+    """创建工单。priority 指业务紧急度。重复调用请复用同一 idempotency_key。"""
+    r = await client.post(f"{API}/tickets", headers=auth(),
+                          json={"title": title, "priority": priority},
+                          params={"key": idempotency_key})
+    if r.status_code in (401, 403):
+        return err("凭证无效或过期，请检查 token，不要重试", retryable=False)
+    if r.status_code == 429:
+        return err("触发限流，请稍等后重试", retryable=True)
+    r.raise_for_status()
+    return ok(r.json())
+```
 
-**5. 先 mock 后真连。** 写一个返回固定样例数据的 mock 模式，先跑通 agent 的决策链路，再切真实 API。这一步能提前暴露大部分 schema 对不上的问题。
+**3. 错误翻译成人话。** 把 HTTP 状态码映射成带决策建议的结构化错误：401 提示"检查凭证、不要重试"，429 提示"稍后重试"。模型一次就能做对动作。
+
+**4. 凭证最小化。** secrets 从环境变量或密钥服务注入，按 workspace 隔离，scope 只开用到的接口，绝不提交进仓库。
+
+**5. 长任务异步化。** p95 超过 5 秒的接口，改成"立即返回 task_id + 提供查询工具"，或走 webhook 回调，别让 agent 干等。
 
 ## 踩坑点
 
-- **超时没设。** 外部 API 挂了，agent 跟着挂住。客户端超时设 10–15 秒，超时后返回结构化错误，而不是让调用悬着。
-- **返回体不做裁剪。** 列表类接口先在 adapter 层分页、截断、挑字段，别把 10MB 的响应原样塞回去。
-- **限流没退避。** 收到 429 后立刻重试只会更糟，简单指数退避（1s / 2s / 4s，最多三次）通常够用。
-- **工具职责重叠。** 两个工具都能"查数据"时，模型的选择会变得近乎随机。要么合并，要么在描述里明确划界。
-- **改 schema 不当变更管理。** 参数改名后，旧会话里的 agent 还在用旧签名调用，报错很难排查。工具定义变更要按接口变更对待，留兼容期。
+- **tool 描述省字省出 bug**：字段含义、默认值、边界条件必须在描述里说清，这是模型唯一的"说明书"。
+- **写操作没带幂等键**：重试一次就多建一条资源，对账时才发现。
+- **原始异常堆栈直接丢回上下文**：既占 token 又误导模型。
+- **只测 happy path**：上线前务必造一批 401 / 429 / 500 / 超时场景，观察 agent 行为是否符合预期。
 
 ## 可复用建议
 
-- 一个工具只做一件事；复合动作在 adapter 内编排，对外仍暴露单工具。
-- 建一张内部错误码表，所有 adapter 共用；agent 系统提示里附一段"遇到某类错误码怎么办"的短说明。
-- 所有外部调用统一走一层 `call_service(name, payload)` 入口，方便埋点、熔断和灰度。
-- mock 样例数据进版本库，作为对接文档的一部分——比口头约定可靠得多。
+- 每个 tool 用一句话说清"做什么、什么时候用"，说不清就拆或合。
+- 错误返回固定三件套：`code` / `human_hint` / `retryable`。
+- 所有写操作默认带幂等键。
+- secrets 不落盘、不进日志。
+- 维护一组固定回归 prompt，改动 tool 定义后跑一遍再上线。
 
 ## 总结
 
-对接外部服务的本质，是把一次不可控的 HTTP 交互，驯化成模型可理解、可决策、可恢复的结构化动作。OpenClaw 侧记住三句话：**描述写给模型看，鉴权留在适配层，错误返回带 hint。** 做到这三点，握手基本就稳了。欢迎在评论区补充你遇到过的对接怪例。
+对接外部服务，"接上"只是第一步。真正决定 agent 稳定性的，是握手的契约质量：清晰的 tool 描述、会说人话的错误、可控的超时和幂等。把这四件事做扎实，模型的表现往往会比预期好一截——多数时候不是模型不行，是接口没教会它。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-28/e22c13e258ba24c9.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-28/1a8091fe03979a45.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-28/5f458ee4c6fc8474.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-28/51be50a32589cacd.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-28/6a99c0ff69228b02.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-28/e1c4ca53282f937c.png)
 
