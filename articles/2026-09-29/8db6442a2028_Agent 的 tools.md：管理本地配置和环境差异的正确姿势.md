@@ -1,70 +1,61 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 39497
+feedId: 39508
 source: 综合讨论
 publishedAt: 2026-09-29
 ---
 
 ## 背景
 
-OpenClaw 的 agent 在会话启动时，会把工作区里的 `TOOLS.md`（部分版本同时读 `AGENTS.md`）注入上下文。它的定位很明确：**写给 agent 自己看的环境说明书**。大多数人的第一版 tools.md 是随手写的——装了什么、路径在哪、习惯用什么命令，想到什么写什么。直到你在第二台机器（家里的 NAS、一台 VPS、或同事的 macOS）上跑同一个 agent，才发现它开始一本正经地执行错误命令。
+OpenClaw 这类常驻 Agent 和普通脚本最大的区别，是它长期跑在"你的机器"上，会自己执行命令。它表现好不好，很大程度上取决于它对本地环境的认知。`TOOLS.md`（工作区约定文件，通常在 `~/.openclaw/workspace/` 下）就是为此准备的：Agent 需要环境信息时读取它，了解这台机器上有什么、路径在哪、惯用哪种包管理器。
+
+我的 Agent 部署在三处：日常开发机（macOS）、一台家庭服务器（Debian）、一台 VPS。同一个任务"跑一下测试"，三台机器的正确做法完全不同。
 
 ## 问题
 
-环境差异导致三类典型故障：
+没有 tools.md 或写法不对时，常见翻车方式：
 
-1. **命令错配**：agent 在 Ubuntu 上用 `brew`，在 macOS 上写 systemd 单元，因为模型默认所有机器长得一样。
-2. **路径幻觉**：它不知道你的项目根目录在 `/home/xx/projects` 还是 `D:\dev`，第一步猜错，后面一路错下去。
-3. **配置散落**：机器事实写进了 prompt 模板，团队约定写进了 skill，改一处忘三处。
-
-更隐蔽的是安全问题：有人图省事把 API key 直接写进 tools.md，而这份文件会被完整送进模型上下文和会话日志。
+- Agent 在 macOS 上用 `apt`，在 Debian 上用 `brew`；
+- Python 路径靠猜，包装进了系统环境；
+- 假设 docker 存在，实际没装；
+- 把所有机器的差异堆进一个文件，写满"如果是 mac 就……如果是 linux 就……"，Agent 读得一知半解；
+- 环境升级后文件过期，Agent 按旧事实行动，且不会告诉你它依据的是过期信息。
 
 ## 做法
 
-核心思路是**分层 + 模板化**：
-
-**1. 区分两个层级。** 机器事实（OS、包管理器、路径、服务管理方式）放全局 workspace 的 tools.md，只属于这台机器；团队约定（构建命令、测试入口、代码规范）放仓库内的文件并提交。两者职责不要混。
-
-**2. 真实文件不入库，模板入库。** 仓库提交 `tools.md.example`，把真实 `tools.md` 加进 `.gitignore`。同事 clone 后复制一份，改成自己的环境。
-
-**3. 用脚本生成初版，别手写。** 几行 shell 就能探测出大部分事实：
-
-```bash
-{
-  echo "# Environment"
-  echo "- OS: $(uname -s) $(uname -r)"
-  command -v brew >/dev/null && echo "- Pkg: brew"
-  command -v apt  >/dev/null && echo "- Pkg: apt"
-  node -v 2>/dev/null && echo "- Node: $(node -v)"
-} > tools.md
-```
-
-**4. 控制篇幅和结构。** 目标 100 行以内，只写"agent 会猜错的东西"。固定五个小节：Environment / Paths / Commands / Gotchas / Never。最后一节尤其有用——把"禁止 `sudo pip install`""不要动 workspace 外的文件"这类约束显式写死，比在对话里反复纠正省事得多。
+1. **一机一文件，不做条件分支。** 每台机器的 `TOOLS.md` 只描述当前环境。差异在文件级别解决，而不是文件内写 if-else。
+2. **只写"可执行的事实"。** 每一条都对应 Agent 能验证的命令：包管理器是 `brew`、Python 用 `~/dev/py311/bin/python`、测试命令是 `make test`。不写散文式介绍。
+3. **固定分区。** runtime、包管理、关键路径、常用命令、已知坑（quirks），每区三五行，全文件控制在 60 行左右，省上下文。
+4. **用脚本生成初稿。** 十几行 shell 探测 OS、包管理器、主要工具版本，输出 draft，人工删改。机器重装后重跑一次即可。
+5. **Git 策略。** 仓库里提交 `TOOLS.md.example` 作模板，真实文件进 gitignore；内网地址、账号路径这类敏感信息绝不写入。
+6. **和 AGENTS.md、MCP 配置对齐。** AGENTS.md 里加一行指引"环境信息先看 TOOLS.md"；文件里声称的工具，应与实际启用的 MCP server / 插件一致，避免 Agent 以为自己有某个工具。
 
 ## 踩坑点
 
-- **写入密钥**：tools.md 会进上下文和日志。密钥放环境变量，文件里只写一句"密钥从 `XX_TOKEN` 环境变量读取"。
-- **改完不生效**：文件在会话启动时注入，改完要重开会话，别以为是写错了。
-- **信息过期**：一条错误的路径比没有路径危害更大。升级系统、迁移目录后记得同步。
-- **与 AGENTS.md 职责重叠**：一个回答"这台机器是什么"，一个回答"在这里做事的规矩"。写重了会出现互相矛盾的指令，agent 的行为会变得不可预测。
+- **写成了 README：** 大段项目背景介绍，Agent 要的是命令和路径，不是文章。
+- **信息过期：** 保留那个探测脚本，怀疑不对时直接让 Agent 重跑核对，比人工回忆靠谱。
+- **混入密钥：** token 写进去一时方便，泄漏时全盘完蛋。
+- **堆太长：** 超过一屏的内容，Agent 遵循度明显下降。细节移到独立文档，TOOLS.md 只留索引。
+- **没被读到：** 路径或命名不符合加载约定，Agent 根本没打开过，等于白写。改完先问一句"你从 TOOLS.md 里看到了什么"验证。
 
 ## 可复用建议
 
-- **让 agent 自审**：隔一段时间发一句"对照 tools.md 逐条运行验证，把失效条目直接改掉"。它有 shell 权限，这事做得比人快。
-- **CI 里加一致性检查**：校验 `tools.md.example` 的章节结构与真实文件对齐，防止有人改了模板忘了同步。
-- **只记差异**：能被探测到的（Node 版本）简写即可；探测不到的（"这个仓库用 pnpm 不是 npm"）才值得完整写一行。
+- 把 TOOLS.md 当"机器清单"而非"文档"，**生成优于手写**。
+- 模板分区固定，新机器五分钟完成初始化。
+- 基础设施变更（换 shell、升级 Python、新增 MCP server）的提交里附带更新 TOOLS.md，当作 review 项。
+- 跨机器同步的是**模板和生成脚本**，不是具体文件内容。
 
 ## 总结
 
-tools.md 不是文档，是 agent 的运行时配置。把它当代码管理：分层、模板化、可生成、可校验、定期维护。做到这几条，同一个 agent 在你的笔记本、服务器和同事机器上，表现会一致得多。
+TOOLS.md 的价值不在文件本身，而在于把"环境差异"从 Agent 的猜测变成显式输入。一机一文件、只写可验证事实、脚本生成、模板入库——四件事做下来，Agent 在哪台机器上都表现得像本地人。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/7f7643faba11dbb8.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/0549f86eb6c4fd05.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/314a82c943d970ea.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/611b88b37bd90bbd.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/5a3101a3d2ff6995.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/86aeceb348f326eb.png)
 
