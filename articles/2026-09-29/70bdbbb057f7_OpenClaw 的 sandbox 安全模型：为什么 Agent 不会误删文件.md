@@ -1,67 +1,56 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 39544
+feedId: 39563
 source: 综合讨论
 publishedAt: 2026-09-29
 ---
 
 ## 背景
 
-OpenClaw 这类本地 Agent 网关最大的特点是：它不只会聊天，还能通过 exec 工具在你机器上直接跑 shell。第一次部署完，很多人的反应都一样——这不等于给一个"语言能力很强但确实会犯错"的东西发了把能碰真文件的钥匙？
+给 Agent 接上文件系统工具之后，大家最担心的往往不是“它能不能干活”，而是“它会不会手滑”。社区里流传的事故截图几乎都是同一类：让 Agent 清理日志，结果它把整个构建目录当成了日志目录。OpenClaw 在设计上把这个问题当作默认假设——不假设模型足够聪明，而是假设它一定会犯错，然后用 sandbox 把犯错的影响范围压到最小。
 
 ## 问题
 
-指望模型自律是不成立的。在 system prompt 里写"请小心操作文件"，属于建议，不是约束；prompt 注入、长上下文遗忘、模型抽风，任何一种都可能让"小心"失效。所以工程上真正要回答的问题是：**当 Agent 一定会执行那条最坏的命令时，损失半径（blast radius）被控制在哪一层？**
+误删的本质是三个环节同时失效：Agent 对路径的解析出错（相对路径、软链接、大小写）、工具层没有区分普通写入与破坏性操作、执行层没有任何兜底。只解决其中一层，事故依然会发生。
 
-## OpenClaw 的做法：分层设防
+## OpenClaw 的分层做法
 
-sandbox 模型的核心思路不是"让模型更聪明"，而是默认模型会犯错，用环境把错误代价压到可恢复，大致四层：
+sandbox 不是单点开关，而是五层叠加，每层独立生效：
 
-1. **工作区约定**。Agent 默认被引导在 workspace 目录内读写，这是 prompt 层的第一道软约束。
-2. **Docker 沙箱**。开启 sandbox 后，exec 在容器内执行，workspace 以 bind mount 挂入容器。`rm -rf` 删的是容器里的路径；没挂载的宿主目录，Agent 根本"看不见"。
-3. **工具策略**。tool policy 可按 agent 收紧 exec：白名单命令、拒绝 `rm`/`dd`/`mkfs` 这类高危调用。策略在工具真正执行前拦截，不依赖模型自觉。
-4. **确认与回滚**。高风险动作可配置为需要人工确认；workspace 用 git 管理，真删错了也能 restore。
+1. **Workspace 根绑定**。文件工具启动时绑定一个 `WORKSPACE_ROOT`，相对路径一律在根内解析；绝对路径落在根外直接拒绝，除非显式写入 allowlist。
+2. **真实路径归一化**。权限校验前先做 realpath：解析 `..`、软链接和挂载点，用最终物理路径判定边界，避免符号链接逃逸。
+3. **操作分级**。工具按 read / write / destructive 分类。删除、截断、批量覆盖属于 destructive，走独立策略，不与普通写操作共用权限。
+4. **删除进回收区**。destructive 操作默认不是 unlink，而是移动到 workspace 内的 `.trash/` 目录，保留期可配置（默认 7 天）。真正的物理删除由独立清理任务执行，Agent 没有直接触达权限。
+5. **能力令牌**。每个 MCP 工具声明自己的 scope，运行时按令牌拦截越权调用。插件装得再多，能碰到的也只有声明过的那部分。
 
-配置示例（字段名以你那版文档为准）：
-
-```jsonc
-{
-  "agents": {
-    "defaults": {
-      "sandbox": { "mode": "all", "scope": "agent" }
-    }
-  }
-}
-```
-
-验证方式很朴素：在容器内外各建一个 `sandbox-test` 目录，让 Agent 跑一句 `rm -rf ./sandbox-test`，看它删掉的是哪一层。五分钟就能确认你的配置是否真的生效。
+实际配置只需三步：在 agent 配置里指定 workspace 根；把确需访问的外部目录（如数据集挂载点）逐条加入 allowlist；确认 `destructive.confirm` 策略为 `trash` 或 `ask`，不要设成 `passthrough`。
 
 ## 踩坑点
 
-- **默认是 `non-main`**：主 Agent 默认不进沙箱，直跑宿主机。很多人以为"装了 Docker 就安全"，主 Agent 其实还在裸奔，要显式设成 `all`。
-- **挂载过大**：把 `$HOME` 整个挂进容器，沙箱形同虚设。只挂 workspace，需要什么补什么。
-- **别把 docker.sock 挂进容器**：等于把宿主 root 交给 Agent，前面三层全白做。
-- **沙箱不防外传**：文件系统隔离挡不住 prompt 注入后的数据外泄，容器出网策略要单独收紧。
-- **无 Docker 环境**：防护只剩策略 + 确认两层，要有意识地补上确认流程和更细的命令白名单。
+- **软链接是最常见的逃逸口**。`node_modules` 里的硬链接、指向 home 目录的快捷链接，会让“看似在 workspace 内”的路径实际指向外部。归一化必须在每次操作前做，而不是会话开始时做一次。
+- **容器内外路径不一致**。Docker volume 挂载后，容器内与宿主机是两套路径映射，allowlist 要写容器视角的路径，写错方向等于没设防。
+- **cwd 漂移**。如果 shell 工具允许 `cd`，后续相对路径的解析基准就变了。OpenClaw 的做法是每条命令在固定 cwd 下执行，文件工具不共享 shell 的目录状态。
+- **allowlist 贪宽**。为了省事把 `$HOME` 整个放行，等于拆掉第一层。按目录粒度给，宁窄勿宽。
+- **glob 过宽**。让 Agent“删掉所有临时文件”时，它自己展开的 glob 可能命中不该删的东西。批量操作前先要求它输出匹配清单，确认后再执行。
 
 ## 可复用建议
 
-- 用"最坏情况演练"评估配置：假设模型 100% 会执行最坏指令，逐层检查后果落点。
-- **最小挂载、最小权限、可回滚**——这三件事的优先级高于任何 prompt 措辞。
-- 保留 exec 审计日志，事后要能回答"它到底执行了什么"。
-- 把沙箱当默认配置，而不是"以后再加的增强项"。
+- 把 Agent 当成聪明但没长记性的新同事：最小权限、全程审计日志、不给 sudo。
+- 批量操作前保证工作区处于干净的 git 状态，或打一个 tar 快照，恢复成本要低于信任成本。
+- 实验性任务放进独立的 scratch workspace，与正式项目物理隔离。
+- 每次新增插件，先看它的 scope 声明，再看功能介绍。
 
 ## 总结
 
-Agent 不误删文件，不是因为模型可靠，而是最坏操作被关在容器里、被策略拦在工具前、被 git 兜了底。OpenClaw 的安全模型本质是承认模型会犯错，然后用环境把犯错的代价降到可恢复。信任可以给，边界要先建。
+Agent 不会误删文件，不是因为模型变可靠了，而是因为最坏情况下它的“删除”只是移动到回收区。分层防御的价值在于：任何一层被绕过——提示注入、路径解析 bug、插件越权——下一层仍然兜底。安全模型的评价标准从来不是“正常使用时没问题”，而是“所有组件都出错时损失有多大”。这一点，值得移植到任何 Agent 工程里。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/dceeb59e59dd306c.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/3b058ec21254297d.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/af6a474a423d079a.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/dbc6f1492993f1d5.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/d972ca1b3143344f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/6a6f67b1ed778532.png)
 
