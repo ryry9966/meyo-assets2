@@ -1,63 +1,52 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 39445
+feedId: 39520
 source: 综合讨论
 publishedAt: 2026-09-29
 ---
 
 ## 背景
 
-OpenClaw 是常驻本机的 Agent 网关，模型默认能用 exec、read、write、edit 这些工具。但模型输出本质是概率生成：长上下文里拼错路径、误判当前目录、被工具返回内容里的注入指令带偏，这些都真实发生过。文件删除不可逆，所以这个问题的答案不能是"相信模型"，而必须是结构性防御。
+让 Agent 拿到 shell 和文件写入工具之后，大家最担心的从来不是它“想干什么”，而是它在概率采样下“手滑”：一条 `rm -rf` 路径解析错了，一个通配符写宽了，目录就没了。OpenClaw 的设计假设很直接——模型一定会犯错，所以执行层必须兜底。
 
 ## 问题
 
-拆开看有三类真实风险：
+社区里反复被问：为什么各种让 Agent 批量改文件、重构目录的实践帖里，几乎没见谁的生产目录被误删？答案不是模型变聪明了，而是 OpenClaw 在执行链路上做了分层隔离，破坏性操作很难真正落盘。
 
-1. **语义错误**：模型把 `$HOME` 当成 workspace 根，`rm -rf "$TARGET"` 里 TARGET 是个空变量；
-2. **注入路径**：网页正文、第三方 MCP 的返回值里夹带指令，诱导 agent 执行破坏性命令；
-3. **权限扩散**：群聊 session、个人 session、插件共享宿主机权限，一处越界处处越界。
+## 做法：五层防线
 
-## OpenClaw 的分层模型
-
-我的理解是四层，各管一段：
-
-**第 1 层：workspace 边界 + 文件工具路径校验。** read/write/edit 在执行前把目标路径解析成绝对路径，与 workspace root 比对，越界直接拒绝。注意：这只约束文件工具，shell 不在此列。
-
-**第 2 层：Docker sandbox。** 在 openclaw.json 里把 `agents.defaults.sandbox.mode` 设为 `all`（或 `non-main`），exec 就在容器里跑，workspace 以 bind mount 挂入。容器里看不到宿主机其余文件系统，shell 里的 rm 物理上够不到挂载范围之外。
-
-**第 3 层：exec 审批与白名单。** 对未命中白名单的高危命令，网关把审批请求推回聊天渠道，人点头才放行。
-
-**第 4 层：会话隔离与快照。** session 级 sandbox 会重建容器并从 workspace 模板拷贝，做坏了丢弃容器重来；重要目录任务前再做一次快照兜底。
-
-落地顺序建议：先切 `all` 模式 → 只挂载 workspace → 容器内非 root 运行 → 配置审批白名单 → 开快照。
+1. **默认沙箱**：Agent 的 exec 和文件操作全部发生在容器/命名空间内，workspace 被挂载为沙箱内的 home 目录，沙箱外的文件系统默认不可见、不可写。
+2. **挂载白名单**：只有显式声明 bind mount 的目录才进入沙箱，且可标记只读。宿主的 home 目录不挂。
+3. **工具策略拦截**：把 `rm -rf`、`mkfs`、`dd of=` 这类危险模式写进 deny 列表，命中即拦截——这是规则判断，不交给模型自己“自觉”。
+4. **审批门 + 审计**：沙箱外的 exec 必须走 approval，gateway 留完整日志，事后可回溯是哪个会话、哪条指令。
+5. **快照兜底**：workspace 放进 git 或定期快照，即使前四层都失效，也能回滚。
 
 ## 踩坑点
 
-- `non-main` 模式下主 session 不隔离，别想当然以为全隔离了；
-- bind mount 图省事挂 `$HOME`，等于没隔离；
-- 容器里挂 `docker.sock` 是经典自爆操作，一条命令就能逃逸；
-- sandbox 默认不限容器出网，`curl` 外传数据这条路是开的，要单独配网络策略；
-- 第三方 MCP 工具不走文件工具的路径校验，接入前按最小权限单独审；
-- 容器内 root 写 bind mount 会把宿主机文件 owner 改乱，UID 要对齐。
+- **图省事把 `~` 挂进沙箱**：这是最常见的一步登天，隔离形同虚设。需要什么挂什么，粒度到目录。
+- **沙箱镜像里带 sudo**：Agent 会自己学会提权，基础镜像务必裁剪。
+- **符号链接逃逸**：workspace 里的软链指向宿主路径时，写入可能穿透。OpenClaw 解析路径时会先 resolve 再校验，但如果你自定义过挂载逻辑，这块要重点测。
+- **为了流畅关掉 approval 后忘了开**：建议用命令白名单放行高频安全命令，而不是全局放行。
+- **MCP 工具旁路**：某个 MCP server 自带文件写能力但没纳入 tool policy，等于给沙箱开了侧门。每个新工具接入时逐个过清单。
 
 ## 可复用建议
 
-- **纵深防御**：路径校验、sandbox、审批、快照四层都当"可能失效"来设计，任何单层不单独兜底；
-- **最小 workspace**：目录里只放任务需要的文件，边界越小越安全；
-- **留证据**：保留 exec 日志和审批记录，事后能复盘到具体哪条命令；
-- **定期演练**：故意让 agent 执行越界删除，验证隔离是否真的生效。
+- 把 workspace 当一次性磁盘：状态进 git，产物及时导出，Agent 删了也能恢复，心态会好很多。
+- 危险操作永远“拒绝默认”。在 prompt 里写“请不要删文件”是请求，不是约束；policy 才是约束。
+- 给每个插件、每个 MCP 工具最小权限，宁可多批一次 approval。
+- 定期做破坏性演练：主动让 Agent 尝试删除沙箱外文件，验证拦截链路是否真的生效，而不是默认它在。
 
 ## 总结
 
-"Agent 不会误删文件"，不是因为模型足够聪明，而是破坏性操作的可达性被结构性收窄了：文件工具被路径校验圈在 workspace 内，shell 被 sandbox 圈在容器内，残余风险由人工审批和快照兜底。安全是系统属性，不是模型属性。具体配置项以你所用的 OpenClaw 版本文档为准。
+OpenClaw 不指望模型永远不犯错，而是假设它一定会犯错。默认沙箱、最小挂载、工具策略、审批门、快照回滚——五层中任意一层兜住，误删就不会落盘。这套模型的价值不在于某一层有多强，而在于没有单点。当你准备把 Agent 从玩具推到生产时，先检查这五层是否都在。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/a6113dfe18dbba46.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/2990ee3996ab58e5.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/0b1129bdb6fc4bfa.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/c70b4e2d7aad57e6.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/b2b3562ff31aadcb.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/41694c69cd78a9b1.png)
 
