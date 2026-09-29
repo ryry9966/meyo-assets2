@@ -1,58 +1,88 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 39437
+feedId: 39501
 source: 综合讨论
 publishedAt: 2026-09-29
 ---
 
 ## 背景
 
-跑 OpenClaw 的 agent 一段时间后，大多数人会撞到同一个拐点：接的 MCP server 越来越多，自定义工具和操作约定不断往 system prompt 里塞。三个月前 2k token 的提示词，现在膨胀到十几 k，模型开始"迷路"——明明有合适的工具，偏偏调了别的；改一处约定，要在长提示词里翻半天。
+OpenClaw 定位是常驻的个人 AI 助手网关：下面接模型，上面接消息渠道，中间靠工具和技能扩展能力。能力一多，最先撞上的是上下文预算——每个 MCP server 的工具 schema 都是常驻 token，十几个 server 挂上去，还没开始干活，系统提示词就已经很重了。Skills 就是针对这个问题设计的补充机制。
 
-Skills 就是 OpenClaw 对这个问题的答案：把能力拆成独立单元，上下文常驻的只有一行元数据，正文和脚本在命中时才加载。本质是渐进式披露（progressive disclosure），和我们做前端懒加载是同一个思路。
+## 问题
 
-## 问题：全量注入的三重代价
+把所有能力都做成常驻工具或塞进系统提示词，有三个代价：
 
-1. **token 成本**：所有能力描述每次请求都付费，哪怕 95% 用不上。
-2. **选择噪声**：可选项越多，模型选错的概率越高。工具列表从 8 个涨到 40 个后，误调用明显变多。
-3. **维护耦合**：能力描述和系统指令混在一个文件里，改任何一处都可能影响全局行为。
+1. **token 成本**：工具 schema 逐字计入每次请求，而大部分会话里 90% 的工具根本用不到；
+2. **选择噪音**：可选项太多，模型容易选错工具，或在功能相近的工具之间摇摆；
+3. **维护成本**：很多"能力"其实只是一段操作流程——用什么命令、注意什么坑，是纯知识，不值得为它维护一个服务。
 
-## 做法：五步写一个最小 Skill
+## 做法：三层渐进加载
 
-1. 建目录：`~/.openclaw/skills/weekly-report/`，里面放 `SKILL.md`。
-2. 写 frontmatter。`name` 用短横线命名；`description` 是路由的关键，要按检索 query 的标准写：包含触发场景、关键词（中英文都要）、以及"不适用时"的说明。
-3. 正文控制在 50 行内：操作步骤、脚本路径、输出格式、硬性约束。脚本单独放同目录，正文只引用路径，别把逻辑内联进 Markdown。
-4. 用 `openclaw skills list` 确认被索引，再用一条真实的自然语言请求验证触发，而不是只看加载状态。
-5. 进 git 仓库管理，变更走 commit，方便回滚和团队共享。
+Skills 的核心思想是渐进披露（progressive disclosure）。一个技能就是一个文件夹：
+
+```
+~/.openclaw/skills/
+└── weather-report/
+    ├── SKILL.md        # 入口：元数据 + 使用说明
+    └── scripts/        # 可选：辅助脚本、参考文档
+```
+
+SKILL.md 用 frontmatter 声明元数据：
+
+```markdown
+---
+name: weather-report
+description: 查询指定城市天气并生成中文日报。当用户提到天气、气温、降雨时使用。
+metadata:
+  requires:
+    env:
+      - WEATHER_API_KEY
+---
+```
+
+加载分三层：
+
+1. **常驻层**：只有 name + description 进系统提示词，每个技能几十个 token，网关把它们汇总成紧凑清单；
+2. **触发层**：模型判断当前任务匹配某个描述时，自己去读 SKILL.md 正文——步骤、命令、注意事项；
+3. **引用层**：正文再引用 scripts/ 或 references/ 下的文件，用到才读。
+
+效果：一百个技能的常驻开销，约等于过去塞一页工具说明。
+
+动手步骤：
+
+1. 在 workspace 技能目录建文件夹、写 SKILL.md，description 里放用户可能说的话；
+2. 声明 requires（环境变量、依赖的二进制），网关做可用性检查，缺依赖会被标记而非报错；
+3. 用 `openclaw skills list`（或对话内 /skills）确认技能已加载、状态 OK；
+4. 用一两句真实请求触发验证，看日志里模型是否读取了 SKILL.md。
 
 ## 踩坑点
 
-- **description 写太泛**。"处理报告"这种描述等于没写，会导致该触发时不触发、不该触发时乱触发。要写清楚输入、动作、产物。
-- **触发词只有英文**。中文用户说"出个周报"，description 里只有 weekly report 是命中不了的。两边都写。
-- **skill 正文超长**。按需加载省的是"没命中的"，命中的那条一样吃 token。超 100 行就该拆分或外移到脚本。
-- **职责重叠**。两个 skill 都声称处理"文件导出"，模型只能靠猜。划清边界，或直接合并。
-- **改完没 reload**。调试时反复怀疑人生，其实是旧版本还在跑。改完重载再测。
-- **脚本环境没写清**。Python 版本、依赖、工作目录假设都要写进正文，否则换个环境就翻车。
+- **description 写成功能介绍而非触发条件**。模型靠它判断"现在该不该用"，写"这是一个天气工具"基本不会命中；要写"当用户提到 X/Y/Z 时使用"。
+- **技能职责重叠**。两个 description 都能匹配同一句话时，命中不稳定，要么合并，要么划清边界。
+- **requires 的环境变量没配**，技能长期显示不可用，还以为写错了——先看状态再排查。
+- **把密钥写进 SKILL.md**。正文会被模型读取、也可能被借鉴，密钥只走环境变量。
+- **乱装第三方技能**。技能本质是注入给模型的指令，存在提示词注入风险，来源不明的先人工审一遍再进目录。
+- **该用 MCP 的场景用了 Skills**。Skills 擅长流程性知识；需要结构化参数校验、强类型接口的，还是走工具协议。
 
 ## 可复用建议
 
-- 一个 skill 只做一件事，宁可多建，也不要写"万能 skill"。
-- description 固定三段式：做什么 / 什么时候用 / 什么时候不要用。
-- 当你发现自己第三次往对话里粘贴同一段提示词时，就该把它沉淀成 skill 了。
-- 每季度审计一次 `skills list`，删掉不再触发的——死 skill 也是噪声。
-- 团队场景下维护一个共享 skill 仓库，比每个人各自养一套提示词可靠得多。
+- 一个技能只做一件事，description 控制在一两句，内嵌触发词；
+- 正文超过一屏就拆文件，SKILL.md 只留主干，细节进 references；
+- 个人工作流放 `~/.openclaw/skills`，团队共享的进版本库——技能就是 Markdown，code review 成本为零；
+- 给不同 agent 配 skills 允许清单，客服 bot 没必要看到部署类技能。
 
 ## 总结
 
-Skills 机制的价值不在于"能装插件"，而在于把提示词工程升级成了能力工程：能力被拆成可命名、可版本化、可独立测试的单元，上下文只保留索引。把每个 skill 当成一个小服务来维护——接口（description）清晰、实现（正文+脚本）收敛、生命周期可管理——agent 的行为才会从"碰运气"变成"可预期"。
+Skills 不是替代 MCP，而是把"常驻工具"和"按需知识"分开：结构化接口交给工具协议，操作流程交给 Markdown。描述写好、边界划清、依赖声明完整，技能目录就是一份可供模型按需检索的运行手册。建议先从一两个高频流程开始抽技能，验证这套机制是否适合你的场景，再考虑规模化。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/5cfaf532fad29c22.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/903e13cd61800e53.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/7125511e8b53312c.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/e7ab4c0b425871af.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/7bee20847fbf3127.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/6edb2962f768992f.png)
 
