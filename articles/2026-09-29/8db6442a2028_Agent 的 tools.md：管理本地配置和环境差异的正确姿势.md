@@ -1,69 +1,71 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 39522
+feedId: 39528
 source: 综合讨论
 publishedAt: 2026-09-29
 ---
 
+# Agent 的 tools.md：管理本地配置和环境差异的正确姿势
+
 ## 背景
 
-跑本地 Agent 的人大多遇到过这个场景：同一套任务在自己机器上好好的，换到服务器或同事的 WSL 里就翻车，Agent 找不到 `uv`，用 `apt` 去装 macOS 的包，或者把输出写进一个不存在的路径。原因很朴素：Agent 对环境的认知靠猜测，而真实环境是异构的。
-
-OpenClaw 工作区里的 `tools.md` 就是用来弥合这个差距的：它是 Agent 每次会话开局会读的"环境说明书"。但不少用法停留在"想到什么写什么"，时间一长，它就变成第二份没人维护的 README。
+跑过本地 Agent 的人都有类似体验：模型能力够，任务拆解也对，最后卡住的往往是环境——路径不对、包管理器不同、端口被占、某个工具只有这台机器装了。人脑里存着这些“默会知识”，Agent 没有。tools.md 的定位就是一份**写给 Agent 看的本地环境说明书**：随 workspace 加载，告诉它在这台机器上怎么正确干活。
 
 ## 问题
 
-常见的失控模式有三种：
+常见的几种错误姿势：
 
-1. **事实手写，迅速过期。** 手填的 Python 版本、模型路径，两周后就成了误导源。
-2. **单文件扛所有环境。** 团队共识和个人机器差异混在一起，要么污染仓库，要么干脆不提交。
-3. **和系统提示词重复。** 同一条约定在 tools.md 和 prompt 里各写一遍，改了一处忘另一处。
+1. **塞进系统提示词**。环境信息写死在 prompt 里，换台机器就得改 prompt，无法版本化、无法协作。
+2. **让 Agent 猜**。猜错的代价是真实的：装了不该装的全局包、改了不该改的配置文件、kill 了别人的进程。
+3. **多机差异靠记忆**。笔记本、家庭服务器、CI 三套环境，约定全在脑子里，Agent 每次都要重新踩坑。
+4. **团队协作无沉淀**。每个人的本地约定只有自己知道，同事的 Agent 来跑任务直接报错。
 
-## 做法
+## 做法：分层 + 收敛
 
-我们的实践是把 tools.md 当作"分层的、部分生成的环境清单"。
+核心是三层结构，机器层覆盖项目层，项目层覆盖全局层：
 
-**第一步：分层。** 仓库根放 `tools.md`，写团队共识：用什么包管理器、测试入口、禁止操作。旁边放 `tools.local.md` 并加入 `.gitignore`，写本机差异：路径、代理、GPU、MCP server 的可用性（headless 服务器上浏览器工具不可用这种事，Agent 自己是猜不出来的）。加载顺序约定为 local 覆盖 repo。
+| 层 | 位置 | 是否进 git | 内容 |
+|---|---|---|---|
+| 全局层 | `~/.openclaw/tools.md` | 否 | shell 习惯、代理设置、通用工具链位置 |
+| 项目层 | `<repo>/tools.md` | 是 | 构建/测试命令、目录约定、禁止操作 |
+| 机器层 | `<repo>/tools.local.md` | gitignore | 真实路径、本地端口、本机独有工具 |
 
-**第二步：易变事实用脚本生成。** OS、shell、工具版本不该手写。放一个 `scripts/gen-env.sh`，每次会话前刷一次：
+写的时候遵循三条收敛原则：
 
-```bash
-{
-  echo "## Generated env facts"
-  echo "- os: $(uname -s) $(uname -r)"
-  echo "- python: $(uv python find 2>/dev/null || echo missing)"
-  echo "- git: $(git --version 2>/dev/null || echo missing)"
-} > tools.local.md.tmp && mv tools.local.md.tmp tools.local.md
-```
+- **只写 Agent 会猜错的事**。它能自己 `ls` 发现的目录结构不用写，`pnpm` 而不是 `npm` 这种必须写。
+- **用指针代替复制**。指向 README 或 Makefile 的对应条目，不要把内容抄一遍，否则必然漂移。
+- **红线单独列**。哪些目录不许动、哪些命令禁止执行、secrets 从哪个环境变量读（只写变量名，不写值）。
 
-**第三步：写约定，不写教程。** 每个工具三行以内：名字、调用方式、一句注意点。细节外链到 docs，别塞进 tools.md。
+每条建议用“场景 → 命令 → 注意点”的格式，Agent 检索和执行都更稳。
 
-**第四步：加一段自检。** 列出 Agent 可直接运行的验证命令（`which uv`、`test -d data/`），让它在动手前确认假设，而不是失败后再猜。
+维护上把它当代码：环境变了顺手改，code review 一起看。还可以定期让 Agent 自检——“按 tools.md 跑一遍 lint 和测试，报告与环境不符的地方”——把过期信息主动暴露出来。
 
 ## 踩坑点
 
-- **别把密钥写进去。** tools.md 会被读进上下文，可能随日志落盘。只写变量名（如 `API_KEY from env`），值留给 `.env`。
-- **控制长度。** 每次会话都在消耗上下文，超过 100 行就该砍，我们一般压在 60–80 行。
-- **层级冲突要显式裁决。** 文件里明确写"local 优先"，否则 Agent 遇到矛盾指令时行为不可预测。
-- **别假设它一定被读。** 在启动流程里固定加载路径，并用一个探测问题（"当前 Python 管理器是什么"）验证过一次链路。
+1. **secrets 写进项目层**。密钥进了 git 历史就洗不掉了。tools.md 里只允许出现变量名和获取方式。
+2. **信息过载**。写 300 行，关键红线被稀释。超过一两屏就该砍，Agent 的注意力是稀缺资源。
+3. **过期比缺失更糟**。工具迁走后没更新，Agent 会一直按旧路径找，且非常自信。
+4. **多文件冲突**。tools.md、AGENTS.md、README 各说一套，Agent 随机采信一个。改动时全链路对齐。
+5. **以为写了就会被读**。不同版本对这类文件的加载时机和优先级不同，写完务必实测验证一轮。
 
 ## 可复用建议
 
-- 提交一份 `tools.example.md` 作模板，区块固定五段：Generated facts / Tool registry / Conventions / Forbidden / Self-check。
-- 把 `gen-env.sh` 挂进项目 bootstrap，让"过期"变成结构上不可能，而不是靠自觉。
-- 每月修剪一次：一个月没被 Agent 用到的条目先删掉，需要时再加回来。
+- 模板三段式：**环境概况**（OS / 包管理器 / 运行时版本）→ **常用命令** → **红线清单**。
+- 仓库里放 `tools.local.example.md` 作为机器层样例，降低新成员上手成本。
+- 把 Agent 犯过的错**回写**进 tools.md，这是它最有效的增长来源，比预想规则有用得多。
+- 团队 PR 模板加一条检查项：“涉及环境变更是否同步更新了 tools.md”。
 
 ## 总结
 
-tools.md 本质是给 Agent 的"配置即文档"：团队共识进仓库，机器差异进 local，易变事实靠生成，关键假设靠自检。把它当代码维护——有模板、有生成脚本、有修剪节奏，Agent 在不同环境里的行为才会从碰运气变成可预期。
+tools.md 本质上是把默会知识显式化：用**分层**解决机器差异，用**版本控制**解决团队协作，用**红线清单**解决安全边界。它不是文档，而是 Agent 和你的机器之间的接口契约。写少、写准、保持更新——做到这三点，Agent 在本地干活的成功率会有肉眼可见的提升。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/71b6020642ff1dde.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/15bc5417bc6a27ca.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/dec4a181bdf2cf2d.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/e6d0fc548beaff79.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/67675c33ebb14c06.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-29/bfb782261d1fdc96.png)
 
