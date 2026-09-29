@@ -1,75 +1,66 @@
 ---
 title: 跨平台消息路由：一个 Agent 同时服务 Telegram 和 Discord
-feedId: 39676
+feedId: 39708
 source: 综合讨论
 publishedAt: 2026-09-30
 ---
 
+# 跨平台消息路由：一个 Agent 同时服务 Telegram 和 Discord
+
 ## 背景
 
-我的机器人最早只挂在 Telegram，群里用得顺手。后来团队讨论主阵地搬去 Discord，第一反应是再起一个 bot——很快就被两份配置、两套会话记忆、两边 prompt 改不同步搞烦了。目标于是很明确：**同一个 Agent、同一份记忆和工具集，两个平台只是不同的入口**。
+我们社区同时维护一个 Telegram 群和一个 Discord 服务器，早期各挂了一个 bot，prompt 和工具集各自独立演进。三个月后两边行为明显漂移：Discord 侧接了检索工具，Telegram 侧没有；同一个人在两边提问会得到不同风格的回答。这次重构的目标很朴素：Agent 内核只保留一份，Telegram 和 Discord 降级为两个"适配器"。
 
 ## 问题
 
-表面上是"多接一个 channel"，实际差异在四层：
+两个平台的消息模型差异比想象中大：
 
-- **消息格式**：Telegram 4096 字符上限 + MarkdownV2 转义地狱；Discord 2000 上限，有自己的 markdown 和 embed。
-- **身份模型**：同一人在两个平台的 user id 完全不同，session 算一个还是两个？
-- **触发方式**：Telegram 群靠 @ 或命令，Discord 靠 mention 和 slash command，触发词不通用。
-- **主动消息**：定时任务、心跳产生的内容，该发给谁？
+- **会话结构**：Telegram 靠 reply_to 和话题群划界，Discord 有 thread 和 slash command，会话边界语义不同。
+- **身份体系**：user id 不互通，同一个真人在两边是两个身份。
+- **输出限制**：Discord 单条 2000 字符，Telegram 4096；Markdown 方言也不一样，Telegram 对 `_ * [` 需要转义。
+- **限流**：两边都有 429，但配额模型和退避策略不同。
+
+所以问题本质不是"接两个 API"，而是：消息规范化、会话路由、输出格式化这三层怎么切。
 
 ## 做法
 
-核心思路：**channel 层只做收发与协议适配，业务逻辑全部收敛在 Agent 侧**，路由策略集中在 gateway 配置里。工具和 MCP server 都挂在 agent 上，两个平台天然共享，不用重复配。
+**1. 适配器只做收发。** 每个 adapter 把平台事件转成统一的 MessageEvent：`platform / chat_id / thread_id / user_id / text / reply_to / attachments`。平台特有字段放进 extras，不进 prompt。
 
-1. **双 channel 接入**。两个 channel 绑到同一个 agent，workspace 与记忆共享（不同版本字段名略有差异，以官方文档为准）：
+**2. 会话路由用 `platform:chat:thread` 做 key。** Discord 侧必须带上 thread_id，否则所有 thread 会话会串进同一个 session——这是最初踩的最大坑。
 
-```json
-{
-  "channels": {
-    "telegram": { "botToken": "env:TELEGRAM_BOT_TOKEN" },
-    "discord":  { "token": "env:DISCORD_BOT_TOKEN" }
-  },
-  "agents": {
-    "default": { "workspace": "~/agent-workspace" }
-  }
-}
+**3. Agent 内核与 MCP 工具全局共享**，权限用 per-platform allowlist 控制：
+
+```yaml
+channels:
+  telegram:
+    allow_groups: ["-100xxxx"]
+  discord:
+    allow_guilds: ["xxxx"]
+    allow_threads: true
+router:
+  session_key: "{platform}:{chat}:{thread}"
 ```
 
-2. **会话键设计**：session key 用 `channel:chatId`，如 `telegram:12345` 与 `discord:98765` 是两个独立会话。要打通就在 agent 侧维护 identity map（手动登记或绑定命令），把两个 id 指向同一 user。建议默认不打通，按需打通，避免两边上下文互串。
-
-3. **出站适配**：所有回复先过统一 renderer，按目标平台降级——长文在 Discord 走分片或附件，在 Telegram 按 4000 字符切块；MarkdownV2 转义只写一个函数，别散落各处。
-
-4. **主动消息显式路由**：定时任务必须指定 `route`（如 `telegram:me`），不给默认值——宁可不发，也不要随机发进某个群。
-
-5. **灰度上线**：Discord 先只开私聊 + 一个测试频道，观察一周再放开群聊。
+**4. 输出层按平台格式化。** 同一份回答先走 formatter（转义/截断/分段），再由 adapter 发送。分段统一按段落切，不做硬字符截断。
 
 ## 踩坑点
 
-- **MarkdownV2 漏转义**：`_ * [ ]` 没处理会导致 Telegram 直接 400，且整条消息失败。统一 escape + 失败降级为纯文本重发。
-- **Discord rate limit**：分片发送要加间隔（约 1 条/秒），批量通知时尤其明显，收到 429 必须退避。
-- **会话强串**：起初把两平台 session 强行 merge，结果 Agent 会引用"另一个群里"的上下文，观感很怪。改成**共享长期记忆文件、保留独立会话**后体验立刻正常——这可能是本篇最重要的一条。
-- **心跳消息忘配 route**：定时汇报发进了测试群，被群友围观了一晚上。
-- **线程语义不对齐**：Discord thread 和 Telegram 话题别指望一一映射，按"回复即跟帖"处理最省事。
+- **编辑消息**：Telegram 用户改消息会再触发一次事件，等于重复提问。按 message_id 去重，并显式约定"编辑视为新提问"还是"忽略"，二选一。
+- **slash command 的 3 秒交互超时**：Agent 跑工具经常超出这个窗口，后来干脆不用 interaction 回复，改成普通消息 + typing 状态。
+- **长任务静默**：工具调用超过 20 秒用户会以为挂了。先发一条"正在检索……"占位消息，成本极低，体验提升明显。
+- **附件格式**：Telegram 给 file_id，Discord 给 CDN URL，统一转成可下载 URL 再喂给 Agent；注意 Telegram bot 端有文件大小限制。
+- **限流退避**：每个 channel 独立队列。Discord 的 429 涉及全局桶，重试时不要把另一个平台也堵死。
 
 ## 可复用建议
 
-- channel 适配层写薄：只做协议转换，格式化逻辑集中到一个 renderer。
-- 出站日志带 channel 标签，排障时一眼区分来源。
-- 发送加幂等 key，webhook 重试不会重复推送。
-- 两平台开关做成独立 feature flag，单边故障不影响另一边。
+- 适配器保持"薄"，业务逻辑全部进 Agent 层；规范化 schema 加版本号，方便回放。
+- 写一个离线回放脚本，把两边真实事件导出成统一 JSON，回归测试不再依赖真实账号。
+- 没有跨平台上下文续聊需求，就不要急着做身份合并（同一个人 TG/Discord 归一），映射的维护成本远高于收益。
+- 每个通道单独打点：消息量、首响应延迟、429 次数。出问题先看这三条曲线。
 
 ## 总结
 
-跨平台的关键不是"多接一个 bot"，而是把**身份、会话、格式、路由**四个问题想清楚再动手。gateway 式架构天然适合这件事：channel 可插拔，Agent 保持单一事实源。落地顺序建议是：先单平台私聊跑通 → 再放群聊 → 最后打通身份映射。顺序反了，每一步都会多踩几个坑。
+重构完成后，接入一个新平台（比如 Slack）只需要写几百行的 adapter，Agent 和工具零改动。核心经验一句话：**把消息进出的脏活和智能分开**，路由 key 设计对了，剩下的都是体力活。大家在多渠道接入上如果有别的路由方案，欢迎评论区交流。
 
 ---
-
-## 配图
-
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-30/cff91d7d416d705f.png)
-
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-30/e070d32ac3de8725.png)
-
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-30/f05dc8a2d01558e1.png)
 
