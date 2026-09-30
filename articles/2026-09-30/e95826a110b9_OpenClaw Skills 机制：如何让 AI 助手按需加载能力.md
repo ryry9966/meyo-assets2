@@ -1,57 +1,74 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 39697
+feedId: 39887
 source: 综合讨论
 publishedAt: 2026-09-30
 ---
 
 ## 背景
 
-OpenClaw 的 agent 长期挂在网关上，对接 Telegram、WhatsApp 等渠道。早期的做法很直接：把所有工具用法、自动化约定全塞进 system prompt。三五个能力时还行，等你要加网页抓取、视频处理、定时任务、多渠道回复规范，prompt 很快膨胀到上万 token——费用上升是小事，真正的问题是模型注意力被稀释，该触发的指令反而漏触发。
+OpenClaw 的 Agent 长期跑在常驻 Gateway 里，能力来源大致三类：内置工具、MCP 服务器、Skills。前两类解决"能不能做"，Skills 解决的是"什么时候让模型知道能做"。
 
-Skills 是 OpenClaw 对这个问题的官方解法：把"能力"从 prompt 里拆出来，做成按需加载的文档模块。
+核心机制是渐进式披露（progressive disclosure）：启动时只把每个 skill 的 `name` + `description` 注入系统提示词，正文在模型判断任务相关时才加载。这就是上下文经济学——常驻 prompt 里塞几十个工具定义和几十行 skill 摘要，差距是几千到几万 token，而且后者直接拖累工具选择的准确率。
 
-## 问题拆解
+## 问题
 
-按需加载要解决三件事：
-
-1. 模型怎么知道有哪些能力？——需要一份极简的能力索引；
-2. 触发后怎么拿到完整说明？——文档正文必须能被工具读取；
-3. 哪些 agent 该开哪些能力？——需要配置层的开关。
+我早期的做法是把所有操作说明全堆进 AGENTS.md：发布流程、设备控制、报表生成……结果上下文膨胀，模型在无关任务里也容易被这些指令带偏。MCP 全量注册工具是同一个病：工具一多，选错的概率明显上升。缺的是一个"按需分发"的层。
 
 ## 做法
 
-一个 Skill 就是一个目录，核心是 `SKILL.md`：
+一个最小可用的 skill 就是一个目录加一个文件：
 
-```text
-~/.openclaw/skills/weather-report/
-└── SKILL.md
+```
+~/.openclaw/workspace/skills/release-helper/SKILL.md
 ```
 
-frontmatter 里写 `name` 和 `description`，正文写操作步骤。关键机制是**渐进披露**：
+SKILL.md 分两段。frontmatter 管元信息：
 
-- 启动时，网关只把所有 skill 的 name + description 注入 system prompt，通常每个只占一两行；
-- 对话中命中某个能力时，agent 再用 read 工具加载对应的 SKILL.md 全文，按其中步骤执行；
-- 用 `openclaw skills` 可以查看、启用/禁用；配置里 `skills.allow` / `skills.blocks` 按 agent 划分子集，多 agent 各挂各的能力包。
+```yaml
+---
+name: release-helper
+description: 打 tag、生成 changelog、发布 GitHub Release 时使用。
+metadata:
+  requires:
+    bins: ["gh"]
+    env: ["GITHUB_TOKEN"]
+---
+```
 
-路径约定也简单：bundled skills 随安装自带，user skills 放 `~/.openclaw/skills`，workspace skills 跟着项目走，方便纳入版本管理。
+正文写操作步骤，能短则短。三个要点：
+
+1. **description 是给模型看的触发广告**。写"什么场景该用"，而不是"这是什么"。
+2. **用 `requires` 做门控**。binary 缺失、环境变量没配时，skill 直接不进候选列表，避免运行时才发现依赖坏了。
+3. **正文超过几百行就该拆**。SKILL.md 只留索引，细节放同级文件，让模型按需读取。
+
+调试用 `openclaw skills list` 看哪些 skill 被加载、为什么被禁用；`openclaw skills info <name>` 看单个 skill 的解析结果。验证触发是否可靠，最直接的办法是新开一个会话，用一句真实任务描述去问 agent，观察它是否命中对应 skill。
 
 ## 踩坑点
 
-- **description 写成功能简介而不是触发条件**。模型是拿它做匹配的，"用于天气查询"不如"当用户问明天穿什么、周末出行天气、降雨概率时使用"。
-- **frontmatter 声明了 `requires.bins`（如 ffmpeg）但机器上没装**，skill 会被静默禁用。改动环境后先跑 `openclaw skills scan` 确认状态，别等到任务失败才排查。
-- **拆得太细**。"读 CSV"和"读 Excel"没必要拆两个 skill，能力越多，description 之间的触发歧义反而越严重。
-- **正文引用 skill 目录外的绝对路径**，换机器就断。脚本、模板尽量和 SKILL.md 同目录打包。
+- **description 太抽象**（比如"辅助开发"），模型几乎不会触发。要写成"当用户要 X 时使用"。
+- **技能职责重叠**，模型随机挑一个。合并或划清边界，比在 description 里加更多限定词有效。
+- **把密钥写进 SKILL.md**——正文会进上下文，等于明文广播。密钥只放环境变量，frontmatter 里只声明依赖。
+- **把"始终生效"的规则做成 skill**。回复风格、语言偏好这类常驻约束该放 AGENTS.md；skill 的语义是"按需"，不是"始终"。
 
 ## 可复用建议
 
-- 把 description 当路由规则写：写清什么样的输入该触发它，而不是它是什么。
-- 先在主 workspace 用一个最小 skill 跑通"索引注入 → 触发 → 全文加载"的链路，再批量迁移存量 prompt。
-- 每季度 review 一次已启用列表，长期没被触发的直接下线，别让能力索引重新变胖。
+- 一个 skill 一件事，命名用领域名词或动词短语，方便人和模型都对齐。
+- 正文控制在 500 行以内，长文档拆成引用文件，让加载分层。
+- 用 git 管理 `workspace/skills`，skill 也是代码，改动要可回溯。
+- 每次新增 skill 做一次"冷启动测试"：新会话、只给任务描述，看触发率。触发不稳定就回来改 description，而不是改正文。
 
 ## 总结
 
-Skills 的本质，是把 system prompt 从"能力说明书"降级成"目录页"。对长期运行的 OpenClaw agent 来说，这不只是省 token 的技巧，而是让能力可以持续增长的结构约束：能力可以一直加，上下文的体积不变。
+Skills 本质上是给模型做上下文的按需分发：常驻的只有目录，详情在任务匹配时才进窗口。写好 description、用 `requires` 门控依赖、控制正文长度——这三件事做到位，agent 的工具选择准确率和 token 开销都会有可感知的改善。它不解决能力本身的问题，但解决了"能力怎么被恰当地知道"的问题，这在长时运行的 agent 里往往更关键。
 
 ---
+
+## 配图
+
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-30/a2773c8f954b1b56.png)
+
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-30/fecc2867f071b913.png)
+
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-09-30/46b4425df7a9e2d2.png)
 
