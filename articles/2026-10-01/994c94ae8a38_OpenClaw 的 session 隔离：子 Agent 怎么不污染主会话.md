@@ -1,62 +1,65 @@
 ---
 title: OpenClaw 的 session 隔离：子 Agent 怎么不污染主会话
-feedId: 39920
+feedId: 39976
 source: 综合讨论
 publishedAt: 2026-10-01
 ---
 
 ## 背景
 
-OpenClaw 的主会话本质是一份持续追加的 transcript：频道消息、工具调用、exec 输出、浏览器抓取结果，全部按顺序堆在同一个上下文里。日常问答没问题，但一旦让主 Agent 亲自跑重活——翻几十个网页做调研、批量改代码——中间产物就全留在 transcript 里了。
+OpenClaw 的主会话是长期资产：它承载你与 agent 的全部上下文、偏好和未完成任务。跑深度调研、批量处理文件、长链路工具调用时，如果直接在主会话里干，很快会把它撑爆——上下文膨胀、token 费用上涨、agent 开始"复述"中间过程。
 
-## 问题
+OpenClaw 提供了子 agent 机制（以 `sessions_spawn` 为例）：把重活丢给一个拥有独立 session 的 agent，跑完把结果带回主会话。机制是现成的，但"隔离"不会自动生效——它取决于你怎么用。
 
-典型的三类污染：
+## 问题：污染是怎么发生的
 
-- **上下文膨胀**：token 消耗上涨，compaction 频繁触发；
-- **注意力污染**：几轮之前无关的报错和日志，影响后面的回答质量；
-- **任务串味**：A 任务的中间状态干扰 B 任务。
+实际用下来，主会话被污染主要有三条路径：
 
-简单 `/new` 能清场，但会把当前任务还需要的上下文一起丢掉。
+1. **过程回灌**。子 agent 的中间结论、工具日志、报错重试，通过最终回复整段带回主会话，一条任务下来几千 token。
+2. **session 复用**。子 agent 没拿独立 session key，或两次 spawn 共用同一个 key，上一次的残留上下文渗进下一次。
+3. **反向污染**。为了"给足上下文"，把主会话历史整份塞给子 agent，子 agent 的输出又带着旧话题回来，两条线搅在一起。
 
 ## 做法
 
-OpenClaw 的解法是子 Agent：主会话通过 `sessions_spawn` 起一个独立 session，核心机制有四点：
+**第一步：spawn 时给独立 session。** 每个子 agent 使用独立 session key（或依赖默认的每次新建行为），不要手工复用。跑完可以到 `~/.openclaw/agents/<agentId>/sessions/` 下确认确实多了一个独立 session 文件，而不是并入了主会话。
 
-1. **transcript 隔离**。子 Agent 有自己的 session key 和会话文件（`agents/<agentId>/sessions/` 下的 jsonl），它的几十次工具调用只写进自己的文件；主 transcript 里只会出现一条 spawn 调用和一条最终结果。
-2. **返回值收敛**。子 Agent 结束时，主会话拿到的只有它的最终答复。把它当"返回字符串的函数"，不是"共享桌面的同事"。
-3. **上下文显式传递**。子 Agent 默认看不到主会话历史。需要什么背景，写进 spawn 的 task prompt，或让它自己去读文件。
-4. **产物落盘**。让重任务的输出写文件（报告、diff、数据），主会话只保留一句结论加路径。需要彻底清场时 `/new`，长期知识沉淀到 memory 文件，别让 transcript 当记忆。
+**第二步：定义返回契约。** 这是最关键的一步，在任务 prompt 里明确：
 
-一次典型流程：主会话收到"调研 X 并给建议"→ 主 Agent 调 spawn，prompt 写清目标、约束、输出格式、结果写入 `~/workspace/x-report.md` → 子 Agent 在自己 session 里跑完十几次工具调用 → 主会话收到 200 字结论加文件路径，上下文几乎没涨。
+- 只返回最终结论，用结构化格式（JSON 或要点式 markdown）；
+- 过程日志、原始抓取内容一律不回传；
+- 大产出写文件，回复里只给路径 + 200 字以内摘要。
+
+一个可以直接抄的模板句：「将结果写入 `/tmp/research/out.md`，回复中只包含：结论 3 条、文件路径、遇到的可复用错误模式。」
+
+**第三步：收窄工具与目录。** 子 agent 只挂它需要的工具（比如只给 browser 或只给 exec），工作目录指向独立的 scratch 目录。注意文件系统默认是共享的，目录隔离要自己做。
+
+**第四步：验证。** 跑一个典型任务，前后对比主会话的 token 用量和消息条数。健康的隔离应该是：主会话只多一条工具结果（几十到几百 token），子 session 里躺着完整过程。
 
 ## 踩坑点
 
-- **spawn prompt 里塞大段原文**：等于把污染提前打包。正确姿势是给文件路径，让子 Agent 自己读。
-- **以为子 Agent"知道"刚才聊了什么**：它不知道。子 Agent 表现差，多数是缺上下文，不是模型不行。
-- **不约束输出格式**：子 Agent 回来 2000 字散文，主会话照样被撑大。要求"不超过 N 字 + 结构化要点"。
-- **递归 spawn**：子 Agent 再开子 Agent，成本和排障难度指数级。除非明确需要，禁止嵌套。
-- **排障看错地方**：子 Agent 失败时去翻它自己的 session jsonl，主会话日志里只有失败结果。
-- **session 隔离 ≠ 文件系统隔离**：两个子 Agent 并发写同一目录照样打架，执行环境隔离要配合 sandbox 或独立 workspace。
+- **最终回复超长**。子 agent 天然倾向写完整报告，不约束的话照样把主会话撑大。字数上限要写进任务 prompt，不能靠默契。
+- **并发写同一文件**。两个子 agent 共享文件系统，同时写一个输出文件会互相覆盖。按任务分配独立子目录。
+- **主 agent 抢着复述**。收到结果后主 agent 有时自动展开一大段总结。如果不需要，在系统提示里加一句"子任务结果未经要求不要展开"。
+- **超时与取消**。被 kill 的子 agent 会留下半截 session，一般无害，但定期清理旧 session 能省磁盘，也避免误读。
 
 ## 可复用建议
 
-- 把子 Agent 任务当**纯函数**设计：输入 = 任务描述 + 文件引用，输出 = 短结论 + 产物路径。
-- 固定一个 spawn 模板，五段式：**目标 / 边界 / 输出格式 / 产物位置 / 禁止事项**，比每次自由发挥稳定得多。
-- 主会话保持"轻"：定期 `/new`，重活外包，结论写进 memory，不指望 transcript。
-- 用 `/status` 观察各 session 的 token 占用，哪个异常膨胀就去查它的 jsonl。
+- 心智模型一句话：**主会话存决策和状态，子 session 存过程**。
+- 把"子 agent 任务 prompt 模板"（含返回契约）存成固定片段，每次 spawn 复用，别现场手写。
+- 每周花一分钟过一遍 session 清单，看有没有异常膨胀的主会话或孤儿 session。
+- 给子 agent 的上下文按需裁剪：只传任务相关的事实，不传聊天历史。
 
 ## 总结
 
-OpenClaw 的 session 隔离是 transcript 级隔离：中间过程留在子会话文件里，主会话只收结果。用好它的前提是把任务边界设计清楚——显式传上下文、约束输出、产物落盘。子 Agent 不是并行帮手，而是帮你把脏活和噪音挡在主会话外面的一道闸门。
+session 隔离在 OpenClaw 里不是一个开关，而是一组工程习惯：独立 session key、明确的返回契约、收窄的工具与目录、跑完即验证。做到这四点，主会话可以长期保持干净——子 agent 随便开、随便扔，重活干得再脏，也不影响主线的判断力。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/d895404de952ee15.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/4fd88b29ee929b19.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/a1bcabdb267f82ef.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/2d96573e9c9b062b.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/2f0f875e2b746b4b.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/5513012ab15ac235.png)
 
