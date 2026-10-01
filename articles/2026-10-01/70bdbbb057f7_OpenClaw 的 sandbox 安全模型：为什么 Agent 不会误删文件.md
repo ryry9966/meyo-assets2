@@ -1,75 +1,70 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 39959
+feedId: 40008
 source: 综合讨论
 publishedAt: 2026-10-01
 ---
 
 ## 背景
 
-让 Agent 直接碰 shell，是自动化实践里最让人手心出汗的事。OpenClaw 中 Agent 通过工具调用拿到执行能力：读写文件、跑命令、接 MCP 工具。于是几乎所有人的第一个问题都是——它会不会一句 `rm -rf` 把我的项目删了？这篇帖拆一下 OpenClaw 的 sandbox 安全模型，讲清楚为什么默认配置下，Agent 删不掉你不想让它删的东西。
+OpenClaw 的 agent 默认带 exec 工具，能直接跑 shell。这意味着模型某次生成 `rm -rf` 的概率并不为零——这不是能力问题，是概率问题。社区里最常被问的一句是：让 agent 自动整理目录，真不怕它把东西删了？
 
 ## 问题
 
-误删通常不是"模型想搞破坏"，而是几类低级但高频的失误：
+风险来自三层叠加：
 
-- **路径幻觉**：把 `./src` 和 `~/src` 搞混，或拼错目录名后"顺手清理"；
-- **命令组合**：`find ... -exec rm {}`、管道、子 shell 里藏了破坏性操作；
-- **间接执行**：写一个脚本文件再执行它，绕过命令层检查；
-- **cwd 漂移**：在错误的工作目录里执行了"清理临时文件"。
+1. LLM 会幻觉路径：把 `~/work` 和容器里的 `/workspace` 混为一谈；
+2. 工具调用没有天然权限边界：exec 继承 gateway 进程的用户身份；
+3. 自动化场景无人值守：误操作发生时，没人去按那个"拒绝"。
 
-只在 prompt 里写"请不要删除文件"是拦不住这些的，sandbox 必须在执行层兜底。
+单靠 prompt 约束（"请不要删文件"）不构成安全边界，这点社区已有共识。
 
-## OpenClaw 的做法：四层防御
+## 做法：分层，不赌模型
 
-sandbox 不是一道闸门，而是叠了四层，任何一层失效还有下一层：
+OpenClaw sandbox 的核心思路，是让"误删"在物理上不可达，而不是指望模型自觉：
 
-1. **工作区边界（jail）**：文件操作默认限制在 workspace 根目录内。路径解析对 symlink 做 realpath 归一化，防止"在工作区里放一个指向外部的软链接再穿越出去"。
-2. **写权限白名单**：workspace 内再分区——源码可写，依赖与配置默认只读，workspace 之外一律拒绝。白名单用显式 glob，不做隐式放行。
-3. **破坏性操作拦截（argv 级）**：对 `rm`、`rmtree`、`dd`、`truncate` 等危险动词拦截，匹配的是解析后的 argv 与工具调用参数，不是对命令字符串做 grep——所以管道和子 shell 里的变形也能命中。命中后默认走软删除：移入沙箱内 trash 目录保留 N 天，而非真删。
-4. **快照 + 审计**：高风险批量操作前对目标子树做写时复制快照；每次文件操作写入追加式审计日志，出问题可回放、可恢复。
+1. **文件系统边界**。sandbox 开启后，exec 在 Docker 容器内执行，宿主机文件系统对容器不可见，只有 workspace 以 bind mount 进入。agent 就算执行 `rm -rf /`，删的也只是容器层。
+2. **模式分级**。sandbox mode 支持 off / non-main / main / all，默认 non-main：子 agent 全部进沙箱，主 agent 留在宿主机保留灵活性。做无人值守自动化，建议直接 all。
+3. **最小挂载**。容器里默认没有你的 `.ssh`、`.aws`、浏览器配置。确实要给 agent 的数据，单独挂，尽量 read-only。
+4. **工具门禁**。配合 tool policy 和 exec 审批，把高危命令模式挡在执行之前，而不是事后翻日志。
 
-配置大致长这样：
+最小配置示例（字段名以你所用版本文档为准）：
 
-```yaml
-sandbox:
-  workspace: ./project
-  write:
-    - ./project/src/**
-  deny:
-    - ./project/.git/**
-  trash:
-    enabled: true
-    retention: 7d
-  confirm_threshold: 10   # 单次影响超过 10 个文件需人工确认
+```json5
+{
+  sandbox: { mode: "all" },
+  agents: {
+    defaults: { workspace: "/home/me/openclaw-workspace" }
+  }
+}
 ```
 
 ## 踩坑点
 
-- **symlink 穿越**：早期版本只检查路径前缀，Agent 在 workspace 里 `ln -s /` 后就能删到外面。教训：边界判断必须基于 realpath，并默认禁止创建指向边界外的链接。
-- **字符串匹配的误报漏报**：grep 命令串要么拦不住 `bash -c "..."`，要么把 `grep rm README` 也拦了。改成 argv 级解析后才稳定。
-- **间接执行**：Agent 把删除逻辑写进 `cleanup.sh` 再跑。现在"执行沙箱内生成的脚本"本身按高风险处理，走同一拦截链。
-- **glob 配宽了**：有人图省事把白名单写成 `**`，等于第三层裸奔。按最小必要给权限。
-- **快照吃满磁盘**：大仓库 + 高频批量操作时很占空间，要配容量上限和自动清理。
+- **误以为所有 agent 都在沙箱里**。默认是 non-main，主 agent 的 exec 直接落在宿主机。配置完先让它 `ls /` 报告看到了什么，再决定信不信。
+- **图省事把整个 home 挂进容器**。等价于没沙箱，还附赠把密钥喂给被注入页面的风险。
+- **给容器挂 docker.sock**。等于把宿主机 root 交出去，任何一次注入都能兑现。
+- **嫌 build 慢于是关沙箱**。正确姿势是用 setupScript 固化镜像层，而不是拆墙。
+- **验证方式不对**。在 workspace 外放一个 canary 文件，让 agent "清理目录"，看它够不够得着——比盯着配置看可信得多。
 
 ## 可复用建议
 
-1. 永远不依赖单层防御：边界、白名单、拦截、快照至少叠两层。
-2. 破坏性操作默认"软删除 + 可恢复"，不可逆动作留给显式人工确认。
-3. 把拦截规则固化成回归测试："删掉根目录下所有文件""清空主目录"这类对抗性 prompt 写成测试用例，每次改 sandbox 都跑一遍。
-4. 审计日志和快照是排障的最后底牌，别为了省空间先砍它们。
+- 默认拒绝：能不挂载就不挂载，能 read-only 就 read-only。
+- 每个 agent 独立 workspace，配合 git，即使误删也有回滚。
+- gateway 用专用低权限账号跑，别用日常账号。
+- 想清楚 sandbox 的定位：它控制的是爆炸半径，不是对抗已拿到 root 的攻击者。
 
 ## 总结
 
-"Agent 不会误删文件"不是模型听话，而是执行层的确定性兜底：路径被关进 jail，写权限被白名单收窄，危险动词被 argv 级拦截并软删除，操作前有快照、事后有审计。模型负责把事做对，sandbox 负责"做错时损失可控"。这套分层思路不绑定 OpenClaw，迁移到任何 Agent + 工具执行的栈上都成立。
+Agent 不删你的文件，不是因为模型足够聪明，而是宿主机的文件系统根本不在它的视野里。OpenClaw 的 sandbox 把"信任模型"变成了"信任边界"：容器是墙，挂载是门，审批是门锁。墙修好了，prompt 才轮到谈礼仪。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/86f0515e5f18d20f.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/efc05c04c53b21b1.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/a5581c2a762dd105.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/2f4c7e78ecf157ef.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/563d3cea8ed9d060.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-01/d2cfd43220680149.png)
 
