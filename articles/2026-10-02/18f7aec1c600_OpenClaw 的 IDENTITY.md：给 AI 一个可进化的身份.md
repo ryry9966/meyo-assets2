@@ -1,56 +1,70 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 40091
+feedId: 40136
 source: 综合讨论
 publishedAt: 2026-10-02
 ---
 
 ## 背景
 
-OpenClaw 的 workspace 里，真正“定义 agent 是谁”的不是代码，而是几个 markdown 文件：AGENTS.md 管行为规则，SOUL.md 管性格与选择，MEMORY.md 管记忆。IDENTITY.md 是其中最不起眼的一个——多数人初始化时填个名字和 emoji 就再没打开过。用久了会发现，它其实承担着一个关键职责：让 agent 在长期运行中保持自我一致。
+OpenClaw 的 workspace 里有几个固定加载的 markdown：AGENTS.md 管行为，SOUL.md 管性格底色，USER.md 记用户信息，IDENTITY.md 管"我是谁"。这些文件在每次会话启动时被拼进 system prompt，相当于 agent 的常驻配置。IDENTITY.md 是其中最小的一个，也是最少被认真写的一个。
 
 ## 问题
 
-没写好 IDENTITY.md 的 agent，常见三种症状：
+没有身份文件的 agent 有几个实际痛点：
 
-1. **人格漂移**：上下文被压缩或会话重启后，agent 的自称和语气开始随机变化，这次是“小助手”，下次又回到默认口吻。
-2. **身份僵硬**：反过来，一次性写死一个详细人设，三个月后使用场景变了，agent 还在按旧设定说话，改起来又怕牵一发动全身。
-3. **多实例串台**：跑多个 agent 共用 workspace 时，两个实例抢同一个名字，自我介绍互相污染。
+1. **人设漂移。** 换个渠道（Telegram、CLI、Discord）重开会话，模型按底层模型的默认习惯重新"猜"一个语气，名字和自称都不稳定。
+2. **多 agent 混淆。** 跑两个 agent 分别对接不同群时，回复风格趋同，分不清谁在说话。
+3. **调教不可沉淀。** 你在对话里纠正过它十次"别这么客套"，但下次会话全忘了——修正只存在于历史消息里，不在配置里。
 
-本质矛盾是：身份既要稳定（否则形同虚设），又要可变（否则跟不上需求），中间缺一个受控的演进机制。
+根源是同一个：身份没有被当作一份可版本管理的配置。
 
 ## 做法
 
-我现在的 workspace 结构和迭代流程：
+**1. 建文件。** 在 workspace 根目录（默认 `~/.openclaw/workspace/`）创建 IDENTITY.md，五行模板足够：
 
-1. **骨架放 IDENTITY.md，只放稳定项**：name、emoji、creature（一个短隐喻，比如“住在终端里的寄居蟹”）、description。描述用第三人称写具体特征，避免“乐于助人”这类正确但无信息量的话。
-2. **易变项外置**：语气偏好和边界感归 SOUL.md；“我负责 XX 项目的运维”这类场景身份写进对应项目目录的局部说明。IDENTITY.md 控制在 20 行以内——它会被注入上下文，写长了挤占实际工作空间。
-3. **用 MEMORY.md 收集摩擦**：日常使用中人设让你不舒服的点（太啰嗦、自称别扭），让 agent 记进 daily notes，打上身份相关标签。
-4. **定期小步改写**：每两周 review 一次这些记录，把确认的结论合回 IDENTITY.md。全程 git 管理，commit message 写清楚“为什么改”，形成一条可回溯的身份变更史。
-5. **冒烟测试**：改完开新会话，问三个固定问题——你是谁、你如何称呼自己、你的边界是什么——对照 diff 确认行为符合预期。
+```markdown
+# IDENTITY.md
+- **Name:** 小钳
+- **Creature:** 机械蟹
+- **Emoji:** 🦀
+- **Vibe:** 资深同事口吻，直接、简短，先给结论再给理由，默认不超过三句
+- **Avatar:** assets/avatar.png
+```
+
+**2. 理解加载时机。** 文件在会话启动时读取，改完需要 `/new` 重开会话（或重启 gateway）才生效，进行中的会话不会热更新。
+
+**3. 分清 IDENTITY 和 SOUL 的边界。** IDENTITY 是表层：叫什么、什么形象、什么语气；SOUL 是里层：价值观、做事原则。我踩过的坑是把"不要过度道歉"同时写进两个文件，措辞略有出入，模型随机遵循其中一个。现在只在一处写。
+
+**4. 建立进化循环。** 把整个 workspace 纳入 git。每周复盘一次：哪些回复不像"它"，把结论压缩成一行改进 vibe 描述，小步提交。三个月下来，这个文件的 git log 基本就是 agent 的调教史。
+
+**5. 多 agent 场景。** 每个 agent 独立 workspace、各自一份 IDENTITY.md，用不同 creature/emoji 区分，群聊里一眼能认出谁在发言。
 
 ## 踩坑点
 
-- **IDENTITY 和 SOUL 写重了**：同一句话出现在两个文件，改了一处忘另一处，agent 行为忽好忽坏。分工要清楚：IDENTITY 回答“它是什么”，SOUL 回答“它怎么选择”。
-- **绝对化人设**：写了“永远热情、从不拒绝”，跟安全规则冲突时会出现诡异的拧巴言行。用倾向性表述，比如“默认友善，遇到风险明确说‘不’”。
-- **改了不生效**：IDENTITY.md 在会话开始时注入，改完当前会话不会变。要么重开会话，要么显式让它重读文件。
-- **中英混杂**：文件用英文写、日常对话用中文，agent 自我介绍会夹生。中文用户建议在描述里显式写明自称和语言习惯。
+- **写太长。** 我见过 60 行的人设，一半是"要幽默但不过分幽默"这种互相打架的描述，模型不会稳定遵循，还每会话白吃 token。控制在 15 行以内。
+- **形容词不可验证。** "聪明、有趣、有温度"没法执行，改成可判定的规则："回复默认 ≤3 句；报错先贴日志片段"。
+- **身份与习惯冲突。** vibe 写了"简洁"，但你天天让它出长报告，冲突时它跟着任务走。要么改文件，要么接受干活时角色让位于任务。
+- **让 agent 自己改身份。** 试过让它"自己优化 IDENTITY.md"，两周后人设漂到不认识。身份编辑保持人工审批，最多让它提 diff。
+- **改了没生效先查路径。** 确认配置里 agent 实际加载的 workspace 路径，别改错目录。
 
 ## 可复用建议
 
-把 IDENTITY.md 当代码对待：进 git、走 review、留变更记录。团队场景可以为不同角色的 agent（运维、code review、客服）做身份模板，只改差异字段。身份进化不需要聪明算法，只需要一条便宜的反馈闭环：摩擦记录 → 定期 review → 小步提交 → 冒烟测试。
+- IDENTITY.md 作为唯一事实源，其他文件不要复述语气类内容。
+- 用"跨渠道测试"验证：新会话里问"你是谁、你怎么说话"，在两个渠道各跑一遍，回答一致才算及格。
+- 身份字段保持统一的键值格式，机器可读，方便脚本做多 agent 状态看板。
 
 ## 总结
 
-IDENTITY.md 的价值不在“让 AI 更像人”，而在用几十行文本解决长期一致性问题。稳定骨架、外置易变项、版本化迭代——“可进化的身份”工程含量就这么多，但便宜到没有理由不做。
+IDENTITY.md 是 OpenClaw 里成本最低、收益最确定的文件：十几行，换来跨渠道稳定的人设和可沉淀的调教过程。把它当 config-as-code 对待——小步改、走版本控制、定期复盘——身份就不再是每次会话碰运气的东西，而是随使用持续进化的资产。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-02/c6d5b2eed6caaf08.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-02/2121c55d89c37827.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-02/c22ca921c815e0b2.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-02/3fb5c180a770f1d2.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-02/aec4b6a74426156c.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-02/139e30c6ca13a464.png)
 
