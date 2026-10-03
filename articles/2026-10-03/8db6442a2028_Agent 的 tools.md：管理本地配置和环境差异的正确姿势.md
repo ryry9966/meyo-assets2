@@ -1,71 +1,61 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 40230
+feedId: 40261
 source: 综合讨论
 publishedAt: 2026-10-03
 ---
 
-# 背景
+## 背景
 
-跑 OpenClaw 或自建 Agent 的人大多有个体验：同一个 workspace，在公司工作站上跑得好好的，换到家里的服务器或笔记本就翻车。原因不在模型，而在环境——包管理器不同、路径不同、代理不同、GPU 驱动不同。模型只能靠猜，猜错就一轮一轮试错，烧 token 还可能误删东西。
+跑 Agent 一段时间后都会遇到同一个问题：同一套提示词，在公司笔记本上跑得好好的，换到家里的服务器就到处报错。原因往往不是模型变笨了，而是 Agent 对"它所在的环境"一无所知——路径不同、包管理器不同、有的机器没 GPU、有的 CLI 根本没装。
 
-MCP 和插件解决了“工具怎么调用”的问题，但“这台机器上的工具长什么样”没人管。把这些写进系统提示词又太脆：换机器就得改 prompt，还容易把私有路径带进共享配置。
+很多人把这些信息写进 system prompt，或者靠记忆文件慢慢"学会"。前者换台机器就要改提示词，后者靠踩坑积累，慢而且不可靠。
 
-# 问题
+## 问题
 
 我踩过的坑大致三类：
 
-1. Agent 默认用 apt 装东西，机器是 macOS，折腾半小时没装上；
-2. 每台机器维护一份不同的 system prompt，三台机器三份配置，改一处漏两处；
-3. 新装了个工具忘了同步，Agent 坚持用旧路径，反复失败。
+1. **事实散落**。某个工具的调用方式写在半年前的某次对话里，Agent 这次凭印象编了个参数，跑挂了。
+2. **幻觉命令**。macOS 上是 `brew`，Debian 服务器上没有，Agent 照写不误。
+3. **配置漂移**。两台机器各自维护了一份环境说明，一周后已经说不清哪份是对的。
 
-# 做法：写一份 tools.md
+## 做法：把环境收敛成一份 tools.md
 
-思路很朴素：把“这台机器的事实”沉淀成一份固定文件，放在 workspace 根目录（我放 `~/.openclaw/workspace/tools.md`），并在 AGENTS.md 里显式引用，保证会话启动时 Agent 会读。
+核心思路一句话：**环境事实与提示词解耦，收敛到工作区里一份结构化的 `tools.md`，Agent 启动时读取，机器差异用 profile 区分。**
 
-我现在的模板大概长这样：
+具体步骤：
 
-```markdown
-# tools.md @ workstation-01（上次校验 2025-06-12）
-- OS: Ubuntu 22.04 / bash；sudo 需要密码
-- 包管理: 系统用 apt；Python 统一走 uv，禁止 pip 装进系统环境
-- 路径: node 在 ~/.nvm/versions/...；ffmpeg 在 /usr/local/bin
-- 网络: 出网走 http://127.0.0.1:7890，curl/wget 需显式带代理
-- GPU: CUDA 12.1，torch 在 ~/envs/ml，不要重建环境
-- 禁改区: /etc/nginx 改动前必须先备份
-- 自检: 动手前先跑 ./scripts/env-check.sh
-```
+1. **建骨架**。在 workspace 根目录放 `tools.md`，只保留五个段落：`environment`（OS/架构）、`toolchain`（可用命令清单）、`paths`（关键路径）、`constraints`（限制，如无外网、无 sudo）、`don'ts`（明确禁止的操作）。
+2. **只写事实**。用短句和键值对，不写散文。Agent 是检索式消费这份文件的，`ffmpeg: 已安装，位于 /usr/bin` 远比一段介绍文字有用。
+3. **机器段自动生成**。手工部分只写通用约定，机器特定内容用脚本探测生成：`uname`、`command -v`、包管理器判断，输出成 `tools.<hostname>.md`，启动脚本负责拼接。生成物不进 git，模板进 git。
+4. **密钥隔离**。tools.md 里只写变量名（如 `GITHUB_TOKEN` 从环境变量读取），绝不写值。
+5. **校验闭环**。十几行的脚本遍历 toolchain 段里的命令逐个 `command -v`，缺失的直接标红。我把它挂在机器启动时跑一次，漂移当天就能发现。
 
-三条原则：
+## 踩坑点
 
-- **分层**：机器级差异进 tools.md（不入 git），项目级约定进项目内 AGENTS.md（入 git）。多机用户可以 `tools.md@workstation`、`tools.md@homelab` 各一份，按 host 注入对应文件。
-- **写事实，不写指令**：“uv 装在 ~/...” 是事实，“请务必小心”是废话。Agent 不需要态度，需要路径、版本和边界。
-- **带自检命令**：给一条 Agent 能自己跑的校验脚本。文字描述会过时，`env-check.sh` 不会。
+- **写成文档不如写成清单**。早期我写过带背景介绍的长段落，Agent 引用率极低，改成键值清单后明显改善。
+- **别把它当记忆文件**。历史决策、踩坑记录放别处，tools.md 里只留"现在为真"的事实，否则上下文白白膨胀。
+- **绝对路径谨慎写**。`/Users/xxx` 换台机器就是坑，能用 `~` 或环境变量就用。
+- **装完新工具不更新**。把探测脚本挂到 shell 配置或安装脚本尾部，让生成物自动刷新，比指望自己记得强。
+- **文件别超过一两百行**。整份注入上下文的话，长度就是成本，砍掉 Agent 用不上的段落。
 
-# 踩坑点
+## 可复用建议
 
-- **过期比缺失更危险**。Agent 会无条件信任这份文件。加“上次校验”日期，或让自检脚本兜底。
-- **别写密钥**。写环境变量名（如 `GITHUB_TOKEN 在 env 中`），不要写值。tools.md 会被原样读进上下文，也可能被截图分享。
-- **控制篇幅**。超过一屏，模型对后半段的遵循率明显下降。我压在 60 行内，次要信息挪进自检脚本。
-- **别指望自动发现**。不引用就不会读。AGENTS.md 里那句“先读 tools.md”是关键一行。
+- 五段式骨架（environment / toolchain / paths / constraints / don'ts）可以直接套用。
+- "手工模板 + 机器生成段"的分层适用于任何多机 Agent 部署，不限于 OpenClaw。
+- 记住一条原则：**约定进模板，事实进生成物，秘密进环境变量**。三者混在一起，迟早漂移。
 
-# 可复用建议
+## 总结
 
-- 团队仓库放一份 `tools.md.template`，成员各自填，CI 只校验格式不校验内容；
-- 让 Agent 自己维护：发现新事实就追加一行，走 PR review diff，人只做确认；
-- 把“禁改区”当安全边界提前写清，比事后回滚省心得多。
-
-# 总结
-
-tools.md 不是新协议，就是把运维里“机器台账”的老习惯搬进 Agent 工作流。它解决的核心问题是：让 Agent 动手之前，先知道“这台机器和别的机器不一样在哪”。一份 60 行以内的实事清单，加一个自检脚本，能消掉大部分跨环境翻车。成本十分钟，值得。
+tools.md 不是什么高级架构，本质是给 Agent 一份它自己的 man page：机器能为它生成的事实，就不要让它去猜。把环境收敛成一份可生成、可校验、可版本化的清单，多机部署的确定性会提升一大截，而整套成本不过一个脚本加百来行 Markdown。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-03/60b77b0456258e37.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-03/da96e5e39b5e3288.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-03/3617e28ee212037b.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-03/1d72a72db7466818.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-03/9a6c833a56c01feb.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-03/7ba2623fff8c4404.png)
 
