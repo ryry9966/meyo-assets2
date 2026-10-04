@@ -1,53 +1,90 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 40506
+feedId: 40511
 source: 综合讨论
 publishedAt: 2026-10-05
 ---
 
 ## 背景
 
-把 Agent 从"能聊天"推进到"能干活"，通常分三步：接模型、接工具（MCP / CLI / 浏览器自动化）、然后往 system prompt 里不断塞使用说明。第三步最容易失控。接入的东西一多——十来个 MCP server、二十几个 CLI 子命令——prompt 里全是文档，token 成本线性上涨，模型选错工具的概率反而上升。
+Agent 玩久了一个问题绕不开：能力越堆越多，system prompt 越来越长。MCP server 一多，工具 schema 全量注入，几十个工具常驻上下文——token 成本上去了，模型注意力反而被稀释，该用的没用上，不该碰的偶尔误触。
 
-OpenClaw 的 Skills 机制就是冲着这个问题来的：能力按需加载。会话启动时，只有每个 Skill 的 name 和一句话 description 进入上下文；正文（SKILL.md 的 Markdown 部分）只在模型判断相关时才注入。本质上是上下文经济学：全量注入是浪费加干扰，完全不注入则模型不知道能力存在，Skills 走的是中间的渐进式披露路线。
+OpenClaw 的解法是 Skills：把"能力"拆成一个一个 Markdown 包，运行时按需加载。它遵循的是 Agent Skills 的通用格式，但落地非常轻：一个文件夹 + 一个 SKILL.md，不需要写代码。
 
-## 做法
+## 机制核心：渐进式加载
 
-**1. 最小结构。** 一个 Skill 就是一个目录，核心是 SKILL.md：YAML frontmatter 写 name、description，需要的话加 requires 声明依赖的环境变量或二进制；正文写使用步骤。放进 workspace 的 skills 目录（或 `~/.openclaw/skills`），重启 gateway 或热加载后生效。
+OpenClaw 在会话启动时，只把每个 skill 的 name 和 description（各一行）注入 system prompt，相当于给模型一份"菜单"。真正的操作说明在 SKILL.md 正文里，只有当模型判断当前任务匹配某个 skill 时，才会用 read 工具把正文读进来。
 
-**2. description 是路由信号，不是简介。** 模型靠这句话决定要不要加载，写法要像路由规则："当用户需要 X 时使用；Y 场景不要用。"写成"这是一个用于……的工具"，基本等于没写。
+常驻成本是 O(技能数) 而不是 O(全部指令长度)。装 30 个 skill，平时多花的可能只有几百 token。
 
-**3. 正文克制。** SKILL.md 正文加载后同样占上下文，写长了等于把 prompt 膨胀换了个地方。步骤、命令、边界条件写清楚即可；大段参考资料放独立文件，正文里引用，让模型按需再读。
+## 动手做：三步创建一个 skill
 
-**4. 验证。** 准备几个"应该触发"和"不应该触发"的测试问法，跑一遍看 debug 日志里 skill 是否被注入。description 的措辞通常要迭代两三轮才稳定。
+**1. 建目录写文件**
+
+在 `~/.openclaw/skills/`（全局）或 workspace 的 `skills/` 目录下：
+
+```
+skills/
+  daily-report/
+    SKILL.md
+```
+
+SKILL.md 最低要求就是 frontmatter + 正文：
+
+```markdown
+---
+name: daily-report
+description: 当用户要求生成当日工作日报、汇总今日会话并推送时使用。
+---
+
+# 日报生成流程
+
+1. 读取今天的会话摘要，按项目分组
+2. 按模板组织：进展 / 风险 / 明日计划
+3. 先给用户确认，再执行推送
+```
+
+**2. 验证加载**
+
+```bash
+openclaw skills list
+```
+
+确认新 skill 在列表中、description 显示正常。
+
+**3. 实测触发**
+
+开一个新会话，用自然语言描述任务，观察它是否主动读取 SKILL.md。也可以直接说"按 daily-report 的流程走"强制触发。
+
+不想手写可以直接从 ClawHub 装现成的：`npx clawhub@latest install <skill-name>`。
 
 ## 踩坑点
 
-- description 太模糊 → 永远不触发；太宽泛 → 每轮都触发，等于白加载还污染上下文。
-- 正文超长，一次加载吃掉省下来的 token，得不偿失。
-- 没写 requires：触发了却在运行时才报缺环境变量或缺二进制，排查很绕。
-- 改了 SKILL.md 以为立即生效，某些配置下其实要重启 gateway，以日志为准。
-- 在 SKILL.md 里放密钥——它会被注入上下文，敏感信息一律走环境变量。
+- **description 含糊 → 永远不触发。**"处理报告类任务"这种写法模型猜不出意图。要写清"什么时候用我"：触发场景 + 输入特征 + 期望产出。
+- **description 太宽 → 过度触发。**写成"辅助编码"，几乎每次对话都会加载，白花 token。
+- **正文太长。**正文是按需加载，但一旦命中就是全量进上下文。长参考资料拆成独立文件，正文里只写"需要时读取 xxx"。
+- **依赖的 CLI 没装。**skill 里写"运行 foo --json"，宿主机却没有 foo，到执行时才报错。建议正文开头列出前置依赖，或用 frontmatter 的 requires 字段声明 bins。
+- **改完不生效。**skill 列表是会话启动时注入的，改完要开新会话，别在旧会话里反复测试怀疑人生。
+- **沙箱/Docker 环境**注意 workspace 挂载路径与权限，全局目录和 workspace 目录的优先级别搞混。
 
 ## 可复用建议
 
-- 把 SKILL.md 当代码管：进 git、走 review、留变更记录，避免文档和工具版本漂移。
-- 一个 Skill 只做一件事，多用途就拆。
-- 每个 Skill 配三五个回归测试问法，改完 description 就跑一遍。
-- 定期看触发率：长期不触发的重写或下线，频繁误触发的说明路由词有问题。
-- 优先引用脚本和文件，而不是把内容内联进正文。
+1. **沉淀流程，而不是堆记忆。**凡是"每次都要口头教一遍"的操作，都值得做成 skill。memory 管"是什么"，skill 管"怎么做"。
+2. **Skill 与 MCP 分工。**MCP 提供工具接口（API、数据库），skill 承载流程与判断逻辑。很多场景一个 skill + bash 调 CLI 就够了，不必强上 MCP server。
+3. **skills 目录放进 git。**SKILL.md 本质是文档，天然适合版本化、review 和跨设备同步。
+4. **定期清理。**`openclaw skills list` 里半年没触发过的 skill，要么修 description，要么删掉。
 
 ## 总结
 
-Skills 机制的收益不来自"有这个功能"，而来自 description 的质量和 Skill 划分的纪律。它本质是 prompt 工程与软件工程的交叉活：description 是接口文档，正文是实现，触发行为是测试要覆盖的对象。按这个标准维护，Agent 的上下文会干净很多，工具选择准确率的提升是顺带的收益。
+Skills 的价值不在"多"，而在"省"：平时只占一行描述，用时才展开完整指令。一句话 description 写得好不好，比十页正文更能决定这个 skill 有没有用。建议从把一个重复性日常流程抽成 SKILL.md 开始，跑通"触发 → 加载 → 执行"链路，再逐步扩充自己的能力库。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/f29089f5a7ca3435.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/70119d67637f7914.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/9b0ac8b71a81a958.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/1d09c84a6e2fbf69.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/dcd2bbb2f7ed0ef4.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/1761d58a579b96f8.png)
 
