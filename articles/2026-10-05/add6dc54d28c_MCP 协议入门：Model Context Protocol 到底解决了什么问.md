@@ -1,65 +1,66 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 40558
+feedId: 40573
 source: 综合讨论
 publishedAt: 2026-10-05
 ---
 
-# MCP 协议入门：它到底解决了什么问题
-
 ## 背景
 
-过去一年做 agent 自动化，真正花在“调模型”上的时间其实不多，大头都耗在**接东西**上：让模型查数据库、调内部 API、操作浏览器、读工单系统。每个 agent 框架有自己的插件格式，每个目标系统要单独写一遍胶水代码，写完还要各自维护鉴权和错误处理。
+接 agent 做自动化，最耗时间的从来不是模型，而是"接线"：让 agent 能查数据库、读工单、跑脚本。每个 host（桌面客户端、IDE、自研 agent 框架）都有自己的插件格式，每个数据源都要单独包一层胶水。3 个 agent × 8 个工具 = 24 份互不通用的一次性代码，改一处全要重测。
 
-## 问题：M×N 的集成税
+MCP（Model Context Protocol）就是冲着这个来的。它把"agent 如何发现工具、调用工具、获取上下文"定义成一套开放协议，2024 年底开源，主流 host 和官方 SDK（Python / TypeScript）都已跟进，OpenClaw 的工具生态也在往这条路上收敛。
 
-本质是一道乘法题：M 个 agent 宿主 × N 个工具/数据源。OpenClaw 的插件是一套写法，其他支持 MCP 的客户端又是一套，同一个“查工单”能力要重复实现 N 遍，且彼此不通用。工具越多，这笔税越重，而且所有胶水代码都散落在各自的 agent 仓库里，没人统一。
+## 它具体解决什么
 
-**MCP（Model Context Protocol）做的事很朴素：把“宿主怎么发现工具、怎么调用工具、怎么读取资源”标准化成一个开放协议。**宿主实现一次客户端，工具方实现一次 server，M×N 直接降成 M+N。
+一句话：把 M×N 的集成问题降成 M+N。
 
-协议里三个核心概念：
+- 以前：M 个 agent 各自适配 N 个工具，工具方要写 M 种封装，agent 方要写 N 种适配。
+- 现在：工具方实现一次 MCP Server，agent 方实现一次 MCP Client，两边按协议握手即可。
 
-- **Tools**：模型可以主动调用的动作（发消息、写文件、查库）
-- **Resources**：可读取的上下文数据（文档片段、配置、状态）
-- **Prompts**：预置的提示模板
+协议里最常用的三类能力：
 
-传输层常见两种：stdio（本地子进程，最简单）和 Streamable HTTP（远程托管）。底层消息是 JSON-RPC，连接建立时双方协商协议版本。
+- **Tools**：可执行动作（查询、发消息、跑命令），入参用 JSON Schema 描述；
+- **Resources**：只读上下文（文件、配置、表结构），模型可"看"不可"改"；
+- **Prompts**：服务端预置的提示模板。
 
-## 做法：十分钟跑通一个最小 server
+底层消息是 JSON-RPC 2.0，传输层本地走 stdio，远程走 Streamable HTTP。
 
-1. 用官方 SDK（Python / TypeScript 都行）起一个 stdio server，先只暴露**一个** tool；
-2. tool 的描述写清楚“什么场景该用我”，入参 schema 尽量扁平，枚举值列全；
-3. 在宿主侧（OpenClaw 的 MCP 配置或其他支持 MCP 的客户端）注册启动命令与参数；
-4. 重启宿主，确认工具出现在工具列表里，手动触发一次，检查返回是否被模型正确消费；
-5. 跑稳之后再加第二个工具，逐步把静态数据迁到 Resources。
+## 最小上手路径
+
+1. 确认你的 host 支持 MCP（OpenClaw、常见桌面客户端、IDE 均可），或用官方 SDK 自建 Client；
+2. 用 SDK 写一个最小 Server，先只暴露一个 Tool，比如 `query_orders(start_date, end_date)`，把 description 写清楚；
+3. 在 host 配置里注册：本地命令行工具填启动命令（stdio），远程服务填 URL；
+4. 先调 `tools/list` 确认工具发现正常，再手动 `tools/call` 一次，检查返回结构；
+5. 跑通后再加第二个、第三个工具，只读数据逐步拆成 Resources。
 
 ## 踩坑点
 
-- **stdout 污染协议流**：stdio 模式下，server 里任何 `print` 或打到 stdout 的日志都会让握手直接失败。日志一律走 stderr，这是新手第一大坑。
-- **描述质量决定调用质量**：工具名和描述是给模型看的 API 文档。写得含糊，模型就会选错工具或编造参数。
-- **工具数量失控**：一次挂 30+ 个工具，选择错误率明显上升。按场景分组、按需启用，比堆数量有用。
-- **长任务阻塞**：同步等待几分钟的任务会拖死整个 agent 循环。要么支持进度通知，要么立刻返回 job id 让模型稍后轮询。
-- **远程 server 的鉴权**：token 别明文写进会被同步的配置仓库，至少走环境变量，正经场景上 OAuth。
-- **错误要结构化**：报错时返回模型能读懂的错误信息，让它有机会自我纠正，而不是裸抛异常直接断流。
+- **description 就是给模型看的 API 文档**。写得含糊，模型会在相近工具间乱选。写清"什么时候不该用我"，比罗列参数更有用。
+- **工具一多，选择准确率明显下降**。别把 50 个工具全注册进去，按任务域分组或动态开关。
+- **stdio Server 挂了经常无声无息**。handler 里写阻塞调用会冻住事件循环，重 IO 交给异步或子进程；stderr 日志要留着看。
+- **报错别直接抛异常**。模型需要可读的错误信息才能自我修正，返回结构化 error 字段，下一轮它就能改对参数。
+- **大结果会撑爆上下文**。查询类工具务必分页或截断，别把整张表吐给模型。
+- **安全边界比想象中薄**。本地 stdio Server 继承你的全部用户权限，别让"读网页"和"删文件"待在同一个不经确认的 Server 里；工具返回内容属于不可信输入，防注入要自己兜底。
 
 ## 可复用建议
 
-- **一个域一个 server**，别做巨无霸；查询和写操作分开，写操作默认要求确认。
-- 返回给模型的是**结论 + 关键字段**，不要把 10MB 原始 JSON 灌进上下文。
-- 给每次 tool call 记录参数、耗时和错误，这是排查 agent 行为最有效的日志。
-- 先写个不带模型的命令行脚本直连 server 做测试，跑通之后再接进 agent，调试成本低一个量级。
+- 一个 Server 只管一个域：文件、Git、数据库分开，便于独立启停和控权限；
+- 只读能力用 Resources，有副作用的才用 Tools，模型对"该不该确认"的判断会准很多；
+- 固定 Server 版本，维护一份自己验证过的清单，社区的你没跑过的别随手装；
+- 给所有 `tools/call` 留审计日志，出问题能回放。
 
 ## 总结
 
-MCP 不负责让模型变聪明，它只是把集成税标准化了——价值在于生态互通，而不是能力提升。真正决定 agent 好不好用的，仍然是工具颗粒度、描述质量和错误处理这些基本功。把它理解成“工具层的 USB-C”，把每个 server 当生产服务来维护，就够用了。
+MCP 不负责让工具变好用，它只负责让工具可插拔。真正的收益在你积累三五个 Server 之后才显现：换 host 不用重写集成，新 agent 接入成本趋近于配置文件里的一行。建议从一个 20 行的最小 Server 起步，把 description 当 prompt 写——剩下的，都是工程细节。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/10850c242edd24b9.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/f2517902b3a9aa8d.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/16b5937abc02ea93.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/2064b7081cd56598.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/853aa7405ea0994b.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-05/d69c5e1f80de203a.png)
 
