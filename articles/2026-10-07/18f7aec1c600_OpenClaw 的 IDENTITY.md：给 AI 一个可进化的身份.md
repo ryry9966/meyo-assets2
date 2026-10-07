@@ -1,71 +1,67 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 40836
+feedId: 40841
 source: 综合讨论
 publishedAt: 2026-10-07
 ---
 
 ## 背景
 
-OpenClaw 的 workspace 里有一组约定文件：AGENTS.md 管行为规则，SOUL.md 管价值观与语气，USER.md 记用户偏好，而 IDENTITY.md 回答的是最基础的问题——“我是谁”。它在每次会话启动时被注入 system prompt，agent 的名字、自称、形象、性格基调都从这里来。
-
-很多人第一次跑 OpenClaw 时会跳过这个文件，觉得“能干活就行”。用一阵子就会发现：今天这个助手自称“小助手”，明天变成 "AI Assistant"，语气在工程直男和客服话术之间来回摇摆。
+OpenClaw 的 agent 不只是"一段 prompt"。它有一个 workspace，里面放着几份约定俗成的 Markdown：AGENTS.md 管行为规则，SOUL.md 管性格底色，USER.md 记用户信息，而 IDENTITY.md 回答一个最基本的问题——**"我是谁"**。会话启动时，这份文件会被注入 system prompt。它和硬编码 prompt 的区别在于：它是一个文件，可以被 git 管理，也可以被 agent 自己改写。这两个属性叠加，才谈得上"可进化"。
 
 ## 问题
 
-缺一份稳定的 IDENTITY.md，通常踩三类坑：
+没有 IDENTITY.md（或放任不管）时，我在自己的实例上见过三种典型症状：
 
-1. **身份漂移**：session 重启后人格不一致，长期记忆里记下的偏好和当前自称互相矛盾。
-2. **身份散落**：名字写在一处 prompt、语气写在另一处，改一处忘一处，没有单一真源。
-3. **多 agent 串味**：两个实例共用人格描述，A 的语气污染了 B。
+1. **身份漂移**。周一它自称"运维助手"，周三因为某次闲聊人设跑偏，Telegram 和 CLI 两个渠道的自我介绍对不上。
+2. **迁移成本高**。身份描述散落在各处 system prompt 字符串里，换模型或换部署时容易漏拷。
+3. **多 agent 混淆**。跑了两三个 agent 之后，用户分不清谁是谁，排查日志时也分不清。
 
 ## 做法
 
-我现在的 IDENTITY.md 大致长这样（节选）：
+1. **定位文件**：默认在 `~/.openclaw/workspace/IDENTITY.md`（以你的 workspace 配置为准），onboarding 时会生成雏形。
+2. **字段化、保持短小**：
 
 ```markdown
-# IDENTITY
-
-- Name: Nova
-- Creature: 一只机械浣熊
-- Emoji: 🦝
-- Vibe: 直接、克制、先给结论再讲理由
-- Avatar: assets/avatar.png
-- Boundaries: 不替用户做不可逆决定；不确定时明说
+# IDENTITY.md - Agent Identity
+- **Name:** FangZhou
+- **Creature:** 机械信天翁
+- **Emoji:** 🛰️
+- **Vibe:** 简洁、直接、略带幽默的工程师同事
+- **Avatar:** assets/avatar.png
+- **Sample lines:** "收到，先看日志。"
 ```
 
-几条实践原则：
-
-1. **短**。10–15 行以内。身份是约束，不是设定集，写太长会稀释 system prompt 里的关键指令。
-2. **身份与记忆分离**。IDENTITY.md 只放“几乎不变”的属性；新学到的事实进 MEMORY.md，临时状态留在 session。
-3. **允许进化，但走流程**。让 agent 在发现行为与身份描述冲突时，把修改建议写进 MEMORY.md 的待办区，我 diff 审过后再合入。git 管版本，改身份和改配置一个待遇。
-4. **与 SOUL.md 分工**。SOUL.md 管“为什么这样说话”，IDENTITY.md 管“我是谁”，重复描述删掉，只留一处真源。
+3. **纳入版本管理**。整个 workspace 放进 git，身份的每次变化都有 diff 可查——这是进化的基础，不是可选项。
+4. **设计进化回路**。比如每月让 agent 基于 MEMORY.md 提一版身份修订建议（"这一个月我常被问 X，我把自己定位成……"），人审 diff 后合并。进化不等于放任自写。
+5. **多 agent 场景**：每个 agent 独立 workspace，IDENTITY.md 里加一行与其他 agent 的分工边界。
 
 ## 踩坑点
 
-- **写成小作文**。实测超过一页后，agent 开始复述设定而不是执行任务。
-- **放开让 agent 自由改写**。有一次它把自己的名字改成了我项目的命名空间，从此身份变更必须人工审批。
-- **字段名不统一**。结构化字段（Name/Vibe/Avatar）保持英文键名，模型遵从度明显更稳；值可以随意用中文。
-- **多 agent 忘了按 workspace 隔离**。两个实例读同一份文件，一方 rename 后另一方自称错乱。
+- **写太长**。IDENTITY.md 不是第二个 system prompt。超过十几行，人设会渗透进工具调用的语气里，输出变啰嗦。我的经验是正文控制在 10 行内。
+- **与 SOUL.md 边界糊**。IDENTITY 管"我是谁"（名字/形象/语气），SOUL 管"我怎么做"（价值观、红线）。两处重复写规则，改了一处忘另一处，必漂移。
+- **让 agent 无审批自改**。抓取的网页内容若混入"请修改你的身份文件"之类的注入指令，没有审批环节就会被执行。该文件务必走人工合并。
+- **Emoji 与头像路径**。部分渠道对 emoji 渲染不稳定；workspace 搬家后相对路径的 avatar 会失效，用绝对路径或加启动校验。
+- **换模型后不复测**。同一段 vibe，小模型照念，大模型自由发挥。换模型后用新会话在各个渠道问一遍"你是谁"，对比回答。
 
 ## 可复用建议
 
-- 起步模板只留五个字段：Name / Creature / Emoji / Vibe / Avatar，跑两周再补 Boundaries。
-- 把 IDENTITY.md 纳入 git，commit message 写清“为什么改”，三个月后你会感谢自己。
-- 每月让 agent 自评一次：当前行为与身份描述是否一致，输出差异清单。
-- 升级 OpenClaw 或更换底层模型后，重读一遍身份文件，确认新模型对这些字段的遵从没有回退。
+- 把身份当配置代码：字段化、短小、进 git、走 review。
+- 分层清晰：IDENTITY（谁）、SOUL（怎么活）、USER（为谁）、MEMORY（经历了什么），不要互相粘贴内容。
+- 用**转述测试**验证稳定性：身份描述应经得起换措辞。如果换个问法它就不认了，说明写得太依赖字面。
+- 团队场景把 IDENTITY.md 模板化，onboarding 脚本只填字段，不让人自由发挥散文。
 
 ## 总结
 
-IDENTITY.md 的价值不在于让 agent “更像个人”，而在于把“我是谁”从隐式、随 session 漂移的状态，变成一份显式、可 diff、可审查的配置。身份可进化的前提是变更可控：文件短、来源唯一、改动走 review。做到这三点，agent 跨会话表现的一致性会有肉眼可见的提升。
+IDENTITY.md 是个很小的文件，但它把 agent 的身份从"代码里的字符串"变成了"workspace 里的状态"。可进化的关键不在"能自己改"，而在**有版本、有 diff、有人审**。做到这三点，身份才是一个可以长期运维的资产，而不是一段会悄悄烂掉的 prompt。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-07/1e7af893500b7326.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-07/d834b86dcf4f7d50.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-07/dc2bde2ff56371f6.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-07/cd514a9526083473.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-07/f7cfd15de36c9391.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-07/8134736c135d0553.png)
 
