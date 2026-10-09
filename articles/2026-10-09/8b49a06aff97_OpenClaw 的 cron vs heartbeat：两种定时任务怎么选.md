@@ -1,73 +1,64 @@
 ---
 title: OpenClaw 的 cron vs heartbeat：两种定时任务怎么选
-feedId: 40970
+feedId: 41024
 source: 综合讨论
 publishedAt: 2026-10-09
 ---
 
-## 背景
+# 背景
 
-Agent 用起来之后，第一个自然需求就是"让它自己动"。OpenClaw 给了两条路：**cron**（传统定时触发）和 **heartbeat**（周期心跳自检）。新手常见的两种翻车：用 heartbeat 做"每天 8 点发日报"，结果不准点还烧 token；用 cron 做"帮我盯着仓库"，结果条件一变任务就废了。
+OpenClaw 里有两套“定时”机制：**cron** 和 **heartbeat**。前者是传统定时任务：到点触发、跑一段固定 prompt、可投递到指定会话或频道；后者是主 agent 的周期性自唤醒：每隔一段时间被网关叫醒一次，看看工作区的 HEARTBEAT.md 里有没有要处理的事，由模型自己判断做不做。
 
-## 机制差异到底在哪
+很多新用户会问：都能定时，用哪个？结论先放这里：**时间驱动用 cron，条件驱动、需要判断的用 heartbeat**。下面展开。
 
-**cron**：你指定时间（cron 表达式或固定间隔），到点由 gateway 触发。prompt 在创建时就固定，默认跑在**隔离会话**里，跑完可以把结果 announce 到绑定的消息渠道。触发是确定性的——"几点干、干什么"都由你定。
+# 问题：一个真实场景
 
-**heartbeat**：Agent 每隔 N 分钟（默认 30m，openclaw.json 里配 `heartbeat.every`，设为 0 可关闭）自己醒一次，读工作区的 `HEARTBEAT.md`，结合**主会话上下文**自行判断要不要做事、要不要开口，可以判断完保持沉默。触发是代理性的——"要不要干"由模型判断。
+我最初把所有事都塞进了 heartbeat：每天早报、定时提醒、监控某个页面有没有更新。结果两个问题：
 
-核心差异就三点：**触发权**（你 vs 模型）、**上下文**（隔离 vs 主会话）、**成本**（按次 vs 每次心跳都是一次模型调用）。
+1. 早报要求“每天 8 点”，heartbeat 是固定间隔轮询，触发时间会漂移，8:07、8:31 都出现过；
+2. heartbeat 每次唤醒都消耗 token，即使大多数唤醒最后什么都没做，一天的空转成本并不低。
 
-## 三条判据
+反过来也有反面案例：把“盯着收件箱，有重要邮件就告诉我”写成 cron，每小时跑一次固定 prompt。但它拿不到主会话上下文，判断标准全靠 prompt 里那几行字，很快变成噪音制造机。
 
-1. 有明确时刻或固定周期 → **cron**。如每天早报、每周一生成周报、每 2 小时拉构建状态。
-2. 没有明确时刻，只有"条件满足才值得做" → **heartbeat**。如盯收件箱、看新 issue、电量提醒。
-3. 混合场景：cron 做粗调度产出，heartbeat 做细巡视兜底。
+# 两者的本质区别
 
-## 具体做法
+- **cron**：到点执行，prompt 固定，运行在隔离会话里，不依赖对话记忆。适合内容和时间都确定的任务。
+- **heartbeat**：到点唤醒，prompt 很轻，agent 带着主会话上下文和 HEARTBEAT.md 自己决定是否行动、行动多少。适合“有事才动”的模糊任务。
 
-**cron：**
+一句话：cron 是“叫它干活”，heartbeat 是“叫它看看有没有活”。
 
-```bash
-openclaw cron add --name daily-digest --cron "0 8 * * *" --prompt "..."
-```
+# 做法与步骤
 
-1. prompt 写成自包含的：隔离会话里它看不到你聊过什么，需要的背景要么写进 prompt，要么让它去读工作区文件。
-2. 配好 delivery/announce 到 Telegram 等渠道，否则结果只躺在会话里没人看。
-3. 定期 `openclaw cron list` 审计，清理僵尸任务。
+1. **先分类。** 列出手头所有定时需求，分两列：触发时间和输出内容都能提前写死的（早报、周报、定时提醒）进 cron；需要看情况判断的（盯收件箱、盯文件变化、检查任务是否卡住）进 heartbeat。
+2. **配 cron。** 用 cron 工具添加任务，写清楚：schedule 表达式、完整的自包含 prompt（别指望它记得上次说了什么）、投递目标。新任务先用短间隔（比如每 5 分钟）跑通，再改成正式频率。
+3. **配 heartbeat。** 在网关配置里设置唤醒间隔（默认 30 分钟够用，不需要就显式关掉）。HEARTBEAT.md 保持精简，每条一行：条件 + 动作，条目控制在 5 条以内。
+4. **两者配合。** cron 负责在固定时间产出结果，heartbeat 负责闲时巡检，发现异常再调用工具深入处理。
 
-**heartbeat：**
+# 踩坑点
 
-1. openclaw.json 里配 `heartbeat.every`（如 `"30m"`）。
-2. 写 `HEARTBEAT.md`：短清单，每条写清"什么条件下做什么"，并显式写上"其余情况保持沉默"。
-3. 观察几天日志，确认触发频率和噪音水平后再调间隔。
+- **时区。** 容器里 cron 按容器时区跑，和你本地差 8 小时是常见事故，上正式任务前先确认时区。
+- **heartbeat 当广播用。** 在 HEARTBEAT.md 里写“每次唤醒都汇报一下”，等于自费买噪音。heartbeat 的默认行为应该是没事就静默。
+- **cron prompt 写得太“诗意”。** “帮我看看今天有什么值得关注的”，agent 会自由发挥，输出结构每次不一样。prompt 里要明确输出格式，并写上“无事则说无事”。
+- **HEARTBEAT.md 越养越肥。** 条目多了每次唤醒都变重，token 成本线性上涨。每周清一次，从来没触发过的条目删掉。
 
-## 踩坑点
+# 可复用建议
 
-- **时区**：gateway 所在机器多半是 UTC，`0 8 * * *` 实际是北京时间 16 点。改机器 TZ 或在配置里显式指定时区，以你的版本支持为准。
-- **心跳频率 = 成本**：每次心跳都是一次模型调用，哪怕它最后选择沉默。15 分钟一次一个月就是近三千次调用，建议心跳用便宜模型或放宽间隔。
-- **HEARTBEAT.md 写太含糊**：要么频繁骚扰你，要么干脆什么都不报。统一用"仅当 X 发生才通知"的句式。
-- **别用 heartbeat 实现准点动作**：心跳只保证"最晚多久会被看一眼"，不保证 9 点整发消息。
-- **网关离线期间 cron 不触发**，重启后是否补跑要自己验证，重要任务别依赖补跑语义。
-- **cron 需要记忆的场景**：让它先读工作区里的笔记文件，比往 prompt 里硬塞上下文稳。
+- 判断规则一句话：**精确时刻 + 固定产出 → cron；需要上下文和判断 → heartbeat。**
+- 分钟级的高频轮询别用 heartbeat，用 cron 短间隔任务，或外部事件触发（webhook / MCP）。
+- cron 的 prompt 当独立脚本来写：输入、动作、输出格式、兜底行为，四要素齐全。
+- 心智模型：heartbeat 是“值班巡检”，cron 是“闹钟”。
 
-## 可复用建议
+# 总结
 
-- 一条决策句式：**能用 cron 表达式写清楚的，就用 cron；需要"看了才知道"的，才交给 heartbeat。**
-- `HEARTBEAT.md` 控制在一屏内，只放当前真的在巡的事项，做完就删，别把它养成第二份记忆文件。
-- 新任务先低频跑一周，确认产出有价值再加密频率；连续两周没触发过动作的任务直接删。
-- cron prompt 里显式限定输出："只报告异常""不超过 100 字"，能有效降低 announce 噪音。
-
-## 总结
-
-cron 是"到点打卡"，heartbeat 是"定时巡逻"。定点、可预期的任务交给 cron；条件触发、需要模型判断的任务交给 heartbeat。两者不是二选一——**cron 产出 + heartbeat 兜底**才是更稳的组合。
+两者不是替代关系。cron 解决“什么时候做”，heartbeat 解决“要不要做”。把确定性的调度交给 cron，把不确定的判断交给 heartbeat，成本和噪音都会明显下降。建议从一条 cron 加三条 heartbeat 条目的小配置起步，跑一周看日志再调整，比一上来铺满配置靠谱得多。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-09/e226be384cbed8db.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-09/aea3c8a56ebbaeb9.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-09/504dc8f617c28a92.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-09/204bf3b02cc10346.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-09/e9cebf372ca0b7c4.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-09/385f95374e02e8a2.png)
 
