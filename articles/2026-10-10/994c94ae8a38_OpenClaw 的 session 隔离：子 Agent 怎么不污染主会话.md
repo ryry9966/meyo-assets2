@@ -1,69 +1,67 @@
 ---
 title: OpenClaw 的 session 隔离：子 Agent 怎么不污染主会话
-feedId: 41087
+feedId: 41126
 source: 综合讨论
 publishedAt: 2026-10-10
 ---
 
 ## 背景
 
-跑多 Agent 自动化流水线时，最常见的问题不是子 Agent 干不了活，而是它干完活之后——几十条工具调用、中间推理、报错堆栈全部回流进主会话。主上下文迅速膨胀，主 Agent 开始“失忆”、重复决策、甚至把子 Agent 的脏数据当成事实。我们在一条持续运行的抓取+代码检索流水线上踩了两周坑，最后靠 OpenClaw 的 session 隔离机制稳定下来，这里把做法整理出来。
+在 OpenClaw 里，一个 agent 在每个通道、每个对端上都有一个主 session（main session）。你在 Telegram/微信里聊的所有内容、触发的所有工具调用，默认都堆在这条会话的上下文里，靠 idle 时间或 reset 指令重置。
 
-## 问题：污染的四种形态
+一旦开始做自动化——定时任务、批量处理、把大任务拆给子 agent——就会遇到本篇的主题：**子 agent 干活的痕迹，怎么不留在主会话里**。
 
-1. **上下文串台**：子 Agent 的中间推理被追加进主会话历史，主 Agent 的注意力被过程性内容稀释；
-2. **工具记录回流**：子 Agent 每次调用的原始输出（动辄几千 token）全部进入主上下文；
-3. **记忆写入泄漏**：子 Agent 往共享 memory store 写入低质量摘要，后续被主 Agent 检索到；
-4. **配置继承**：子 Agent 默认拿到主会话的环境变量和全部 MCP 连接，权限面过大。
+## 问题：什么算"污染"
 
-## 做法：五步隔离
+三种典型情况：
 
-```yaml
-subagent:
-  session: ephemeral          # 一次性独立会话，不复用主 session_id
-  inherit_context: summary    # none / summary / selective
-  tools:
-    allow: [web.fetch, code.search]   # 最小工具集
-  mcp:
-    inherit: false            # 不继承主会话的 MCP 连接
-  ttl: 15m                    # 到期即销毁
-  return:
-    mode: structured          # 只回传结构化最终结果
-    max_tokens: 800
-```
+1. **过程回流**：子 agent 的中间工具调用、长篇输出被写进主会话历史，上下文膨胀，模型注意力被无关内容稀释，token 账单跟着涨。
+2. **串台**：子 agent 或插件直接往主 session key 发消息，用户聊着 A，中途插进来一句 B 的进度汇报。
+3. **长任务占坑**：后台任务复用主 session 跑批，对话中途上下文被冲掉，体感就是"它失忆了"。
 
-1. **独立 session_id**：子 Agent 用一次性 id 创建，结束即销毁，杜绝历史残留；
-2. **context 策略收窄**：`summary` 模式下只传摘要，长任务配合 `max_tokens` 限制回传体积；
-3. **工具与 MCP 白名单**：按任务下发，而不是继承全量；
-4. **结构化回传协议**：子 Agent 只返回约定格式的结果 JSON，过程性内容留在子会话里；
-5. **TTL + 异常捕获**：超时销毁，错误不透传堆栈，只返回错误码和一句话原因。
+排查方法很直接：跑 `openclaw sessions`，看主 session 对应的 `.jsonl` 是不是异常肥大，翻一翻里面有没有本不该出现的工具调用记录。
+
+## 做法
+
+1. **子任务一律 `sessions_spawn`，不要 `sessions_send` 进 main**。spawn 出来的子 agent 在 `~/.openclaw/agents/<agentId>/sessions/` 下有独立会话文件，结束后只把 summary 返回给调用方。
+2. **spawn 的 prompt 要自包含**：任务目标 + 输入路径 + 输出格式 + 超时条件，四段式写清楚。不要把主会话历史整段贴进去——贴了就等于没隔离。
+3. **长跑任务用独立 agentId**。cron、webhook 这类没人盯着的事，配一个专职 agent，和交互主会话物理分开。
+4. **约定回传格式**。让子 agent 只回结论和关键数据（写进 results 文件或输出 JSON），主会话读结论，不读过程。
+5. **定期巡检**。列一下体积 Top 的 session，超过阈值的归档或清理。
 
 ## 踩坑点
 
-- `inherit_context: summary` 不等于零污染——摘要本身也占主会话预算，一定要限 `max_tokens`；
-- **共享文件系统是隐性通道**：子 Agent 写了中间文件，主 Agent 读到了“看似合理”的脏数据，这种污染最隐蔽；
-- 子 Agent 异常未捕获时，默认行为是把完整堆栈回流，务必在 return 层拦截；
-- 图省事复用 session_id，上一轮的历史会残留，这是我们发现频率最高的事故；
-- 并发多个子 Agent 共享限流和密钥，一个把配额打满，全体超时。
+- **文件系统是共享的**。session 隔离 ≠ 工作区隔离：子 agent 改了工作区文件，影响同样会"回流"到主会话后续行为。需要硬隔离时，给子 agent 指定独立 cwd 或临时目录。
+- **不设超时**。子 agent 卡在一个工具调用上，session 会一直占着，最好显式给 timeout。
+- **同名 sessionPrefix 复用**。两个子 agent 用了相同前缀和名字，会话被复用互相覆盖，排查时容易误判成模型抽风。
+- **图省事复用主 session 跑批**。插件里为了少写几行配置直接用 main key，短期没事，量一上来主会话必脏。
 
 ## 可复用建议
 
-- 把子 Agent 当**函数**对待：输入参数化、输出结构化，不读也不改全局状态；
-- 主会话只保留决策上下文，一切过程性上下文下沉到子会话；
-- 给子 Agent 的 memory 写入加独立 namespace，定期审计；
-- 灰度阶段先开 session 级日志确认隔离生效，再逐步收窄权限。
+一条原则：**主会话只留对话与决策，子会话承担执行与噪音**。判断标准很简单——这段内容一个月后还需要出现在主上下文里吗？不需要，就 spawn 出去。
+
+spawn prompt 模板可以直接固定下来：
+
+```
+目标：<一句话>
+输入：<文件/数据路径>
+输出：<格式约定，如 JSON schema>
+约束：<超时、停止条件、禁止外发的范围>
+```
+
+再配一个几行的巡检脚本挂在 cron 上，每周报一次 session 体积，异常增长早发现。
 
 ## 总结
 
-session 隔离的本质是一句话：**过程留在子会话，结论回到主会话**。配置本身不复杂，难在守住三条纪律——一次性 session id、最小工具集、结构化回传。做到这三条，主会话在长任务下的稳定性会有肉眼可见的改善。欢迎在评论区交流你们的隔离策略。
+session 隔离不是某个配置项一开就完事，本质是上下文管理策略：**哪里产生噪音，就在哪里建边界**。做得好，主会话轻、响应稳、成本可控；做得不好，spawn 只是形式主义，上下文照样被稀释。建议从"cron 任务迁移到独立 agent + spawn prompt 模板化"这两件小事开始改，收益很快能看到。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-10/45adf0d3acd6e422.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-10/533bc1a03e113cd5.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-10/ebc6b2e1dc4972ce.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-10/a7fb6072e5f96c7f.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-10/09333128f205c930.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-10/54b0339a7cc53fc0.png)
 
