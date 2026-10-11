@@ -1,64 +1,75 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 41209
+feedId: 41216
 source: 综合讨论
 publishedAt: 2026-10-11
 ---
 
 ## 背景
 
-每个做 Agent 的人早期都手写过一遍 function calling：系统提示里塞工具定义、解析模型输出、自己执行、把结果拼回上下文。Demo 阶段没问题，但当你有 3 个 Agent 应用、10 个数据源（文件系统、数据库、内部 API、工单系统），就要维护 30 份胶水代码，换个模型厂商还得重写一遍工具协议。这就是经典的 N×M 集成问题。
+Agent 能力上不上得去，卡点往往不在模型，而在"接工具"这一层。你想让自动化 Agent 读本地文件、查数据库、调内部 API，每种接法都要写一遍胶水代码；换个宿主框架、换个模型，还得再写一遍。
 
-MCP（Model Context Protocol）是 Anthropic 在 2024 年底开源的协议，目标就是把这个问题降成 N+M：工具方实现一次 MCP Server，任何支持 MCP 的 Host（Agent 运行时、IDE、桌面客户端）都能直接接入。
+MCP（Model Context Protocol）是 Anthropic 在 2024 年底发布的开放协议，一句话概括：给模型和外部工具/数据之间定一个标准插座。目前 Claude Desktop、主流 IDE 和多数 Agent 框架已支持客户端角色，生态里也积累了不少可直接复用的 MCP Server。
 
-## 它到底标准化了什么
+## 它到底解决什么问题
 
-MCP 基于 JSON-RPC 2.0，核心做了三件事：
+经典问题是 M×N：M 个 Agent 宿主 × N 个工具，理论上要写 M×N 份集成代码。每个宿主有自己的 tool calling 格式，每个工具有自己的接入方式，全靠胶水代码堆。
 
-1. **能力发现**：Host 通过 `tools/list` 拿到服务器暴露的工具清单，每个工具带 JSON Schema，模型据此决定何时调用。
-2. **统一调用**：`tools/call` 走同一套报文格式，Host 不关心工具背后是 shell 脚本还是 SaaS API。
-3. **进程/网络边界**：本地服务器走 stdio，独立进程运行，崩了不连累主程序；远程服务器走 Streamable HTTP，凭证可以集中管理。
+MCP 把它压成 M+N：宿主实现一次 MCP Client，工具实现一次 MCP Server，中间用 JSON-RPC 2.0 通信。协议定义了三类原语：
 
-协议还定义了 resources（只读数据）和 prompts（模板），但实际 80% 的场景只用 tools 就够。
+- **Tools**：模型可调用的动作（查询、写入、执行）
+- **Resources**：可注入上下文的数据（文件、日志、表结构）
+- **Prompts**：预置的提示词模板
 
-## 上手步骤
+## 跑通最小路径
 
-建议先跑现成服务器，再自己写：
+以最简单的 stdio 方式为例，三步：
 
-1. 启动官方 filesystem 服务器（stdio 传输）：
-   ```bash
-   npx @modelcontextprotocol/server-filesystem ~/projects
-   ```
-2. 在客户端配置里声明这个 server（OpenClaw 的 MCP 配置块或 `claude_desktop_config.json`），写清命令、参数、允许访问的目录。
-3. 重启后验证发现是否生效：问一句"你能访问哪些文件"，或用 `@modelcontextprotocol/inspector` 可视化调试，能直接看到 `tools/list` 和 `tools/call` 的完整报文。
-4. 自己写服务器时用官方 TS/Python SDK，核心就是给每个工具定义 name、description、inputSchema，再实现对应 handler。
+1. 选一个现成 Server（比如文件系统）挂到宿主配置里：
+
+```json
+{
+  "mcpServers": {
+    "fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+    }
+  }
+}
+```
+
+2. 重启宿主，确认工具列表出现在会话里。
+3. 用自然语言触发一次调用，检查返回结构能否被模型正确理解。
+
+跑通之后再考虑自己写：官方 SDK（Python/TypeScript）十几行就能包一个 Server。把已有的 CLI 脚本直接暴露成 Tool，通常比重写划算。
 
 ## 踩坑点
 
-- **description 是写给模型看的**。"查询数据"这种描述模型根本不会用；要写清楚什么场景该调用、参数格式、失败时返回什么。
-- **stdio 服务器别往 stdout 打日志**。stdout 被 JSON-RPC 占用，日志混进去会直接搞挂会话，日志一律走 stderr。
-- **工具数量爆炸**。每个工具的 schema 都吃上下文 token，挂 40 个工具后模型的选择质量明显下降。按场景拆分 server、按需启用。
-- **安全别裸奔**。filesystem 服务器授权到根目录、DB 服务器用可写账号，都是真实出过事的配置。默认最小权限 + 路径白名单。
-- **警惕第三方 server 的结果注入**。工具返回内容会进模型上下文，恶意页面可能借工具结果诱导下一步高危调用，这类操作务必保留人工确认。
+- **stdio Server 继承宿主环境变量**。Node/Python 版本不一致是最常见的"起不来"原因，先在终端手动跑一遍命令再排查配置。
+- **Tool 描述就是给模型看的文档**。描述含糊，模型就选错工具、传错参数——很多"MCP 不工作"其实是描述写得不行。
+- **别把 30 个工具全挂上试试就知道了**：上下文膨胀，命中率骤降。按场景拆配置，用哪个挂哪个。
+- **传输方式有讲究**：stdio 简单但只能本地；Streamable HTTP 适合远程，但涉及 OAuth 2.1 鉴权，部分宿主支持还不齐，混合环境要提前验证。
+- **安全别裸奔**：MCP Server 以你的本地权限运行，来源不明的第三方 Server 等于交出 shell；Resource 返回内容会被注入上下文，警惕间接提示注入。
 
 ## 可复用建议
 
-- 一个 server 只做一类事，小而稳比大而全好维护。
-- 大结果集做分页或摘要，别一次性灌进上下文。
-- 上线前用 inspector 把每个工具的异常路径跑一遍，确认错误信息模型能看懂。
-- 优先复用社区现成 server，接入前确认维护活跃度和权限模型。
+- 先 stdio、先少量工具、先复用现成 Server，跑通再加复杂度。
+- Tool 描述按"给模型看的 API 文档"标准写：做什么、参数含义、什么场景该选它。
+- 读写分离，危险操作单独成 Tool，并在描述里声明需要确认。
+- 锁定 SDK 版本。协议还在迭代，注意 protocol version 的兼容声明。
+- 把内部脚本包成 Server，而不是迁到某个平台，保留随时撤出的能力。
 
 ## 总结
 
-MCP 解决的是工程问题，不是模型能力问题：把"每个应用适配每个工具"的集成矩阵，变成一次实现、处处接入的协议层。它不会让 Agent 变聪明，也不会替你解决鉴权和可观测性的全部细节，但能把工具生态的接入成本压到接近边际为零——这正是 Agent 从 demo 走向生产最缺的那块基础设施。
+MCP 解决的不是模型能力问题，而是集成层问题：把点对点的胶水代码收敛成标准接口。它不会让你的 Agent 突然变聪明，但能让你在换宿主、换模型、加工具时少写九成胶水代码。对做自动化和插件生态的人来说，它是目前值得押注的一层标准。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-11/22b4d6dc7b630e9b.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-11/8fffadc6578c9e63.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-11/6f19192f44d9eab4.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-11/5987d686bd9b04cb.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-11/85bef965ee5caf61.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-11/14660055a3af038e.png)
 
