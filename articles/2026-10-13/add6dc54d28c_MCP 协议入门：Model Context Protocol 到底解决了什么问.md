@@ -1,75 +1,74 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 41371
+feedId: 41454
 source: 综合讨论
 publishedAt: 2026-10-13
 ---
 
-# 背景
+## 背景
 
-做 Agent 的人大概率都遇到过同一个困境：模型的推理能力不缺，缺的是"够得着"的上下文和工具。想让 Agent 读本地文件、查数据库、调内部 API，每接一个数据源就得写一套胶水代码，换个框架再来一遍。
+过去两年做 Agent 开发的人大多遇到过同一个困境：模型本身能力不差，但要让它"动手"，就得为每个目标系统写一遍胶水代码。接 GitHub 要写一套 function calling 的 schema，接内部数据库再写一套，换个 Agent 框架，这些集成逻辑还得重写。这就是典型的 M×N 问题：M 个应用 × N 个工具，集成成本是乘法关系。
 
-2024 年底 Anthropic 开源了 Model Context Protocol（MCP），定位很朴素：给"模型应用 ↔ 工具/数据源"之间定一个开放协议，思路类似 LSP 之于编辑器。OpenClaw 生态里 MCP 已经是插件接入的主流方式之一，值得把底层逻辑搞清楚。
+2024 年底 Anthropic 开源了 MCP（Model Context Protocol），目标是把 M×N 拉平成 M+N：应用方只需实现一次 MCP 客户端，工具方只需实现一次 MCP 服务端，中间用统一协议对话。它基于 JSON-RPC 2.0，目前有官方的 Python 和 TypeScript SDK，生态里的 server 数量增长很快。
 
-# 问题：M×N 集成爆炸
+## 它到底解决了什么
 
-没有标准时：
+MCP 的核心抽象只有三类原语：
 
-- 有 M 个 AI 应用、N 个工具，最坏要维护 M×N 套适配；
-- 每个工具的鉴权方式、参数格式、错误语义各不相同；
-- 同一个能力（比如查 Postgres）在每个 Agent 框架里重复实现；
-- 上下文注入（文件、日志、检索结果）也没有统一入口。
+- **Tools**：模型可主动调用的动作（查数据、执行命令）；
+- **Resources**：应用侧可控的上下文数据（文件、记录）；
+- **Prompts**：用户侧可控的预设模板。
 
-MCP 的价值是把 M×N 压成 M+N：工具方写一次 MCP Server，任何支持协议的宿主都能直接用。
+价值不在于"又多了一个协议"，而在于它定义了清晰边界：谁控制什么、消息怎么流转、能力如何被发现（`tools/list`、`tools/call` 等标准方法）。这让"接入一个新数据源"从写代码变成装插件。
 
-# 协议最小集合
+## 上手步骤
 
-- 基于 JSON-RPC 2.0；
-- 三个核心原语：**Tools**（模型可调用的函数，带 JSON Schema 参数）、**Resources**（可读取的上下文数据）、**Prompts**（预置提示词模板）；
-- 两种传输：stdio（本地子进程）和 Streamable HTTP（远程服务）。
-
-# 做法：接一个最小 MCP Server
-
-1. 选一个真实的小场景，比如让 Agent 查询内部服务状态。
-2. 用官方 SDK（Python/TypeScript 均可）定义工具：
+以 Python 为例，一个最小可用的 MCP server 只要十几行：
 
 ```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("demo-tools")
+
 @mcp.tool()
-def get_service_status(service: str) -> str:
-    """查询指定服务的运行状态，返回 JSON 字符串"""
+def get_issue(repo: str, number: int) -> str:
+    """根据仓库和编号返回 issue 概要"""
     ...
+
+mcp.run(transport="stdio")
 ```
 
-3. 在宿主配置里注册该 server，本地调试用 stdio 最省事。
-4. 跑通一次完整调用，重点观察三件事：模型是否选对了工具、参数是否合法、返回是否撑爆上下文。
+建议按这个顺序走：
 
-# 踩坑点
+1. 用 MCP Inspector（`npx @modelcontextprotocol/inspector`）先把 server 跑通，确认工具能被列出、能被调用；
+2. 再接入宿主（Claude Desktop 或你自己的 Agent 框架），本地进程用 stdio，远程服务用 Streamable HTTP；
+3. 观察模型的工具选择行为，再回头修改工具描述。
 
-1. **工具描述就是 prompt。** 模型靠 description 决定用不用这个工具，写"查询数据"这种模糊描述，模型会在不该调的时候乱调。
-2. **工具不是越多越好。** 单个 server 暴露 20+ 个工具，选择准确率明显下降。按领域拆，一个 server 只管一件事。
-3. **输出要节流。** 返回几万字符的日志直接进上下文，token 烧得快还干扰推理。默认截断 + 提供分页参数。
-4. **安全边界。** MCP Server 拿的是你的本机凭证和环境变量，第三方 server 不要盲装；工具返回内容里可能藏注入指令，所有写操作务必加人工确认。
-5. **stdio 与 HTTP 别混着配。** stdio server 的 cwd、环境变量继承经常出问题，报"工具不存在"先查子进程有没有起来。
+## 踩坑点
 
-# 可复用建议
+- **工具描述就是 prompt。** 模型选不选、怎么调用某个工具，几乎完全取决于名称和描述。描述含糊，调用就飘，参数也容易填错。
+- **stdio 模式下别往 stdout 打日志。** stdout 被 JSON-RPC 流占用，`print` 一次整条会话就断了，日志一律走 stderr。
+- **工具数量要克制。** 一次挂几十个工具，上下文膨胀，选择准确率明显下降，应按场景拆分加载。
+- **安全上别乐观。** MCP server 以你的凭证运行，工具返回内容会被拼进模型上下文——返回值里的注入文本可能诱导模型误操作。权限最小化，写操作加确认层。
+- **版本兼容。** 早期文档里的 HTTP+SSE transport 已被 Streamable HTTP 取代，老客户端对接新 server 时先确认协议版本。
 
-- 起步只做 2~3 个工具，先跑通闭环再扩展；
-- description 里写清三件事：干什么、参数含义、失败时返回什么；
-- 工具命名加命名空间前缀（如 `github_create_issue`），避免多 server 重名；
-- 每次调用记日志：入参、耗时、返回大小，排障基本靠这个；
-- 读操作和写操作分开实现，写操作默认要确认。
+## 可复用建议
 
-# 总结
+- 一个 server 只做一类事，不要造"万能工具箱"；
+- 描述当 prompt 写，参数名当文档写；
+- 先只读后写入，写操作永远留一层确认；
+- 密钥走环境变量，不进代码和配置仓库；
+- 任何 server 先过一遍 Inspector 再上生产。
 
-MCP 解决的不是模型能力问题，而是"接入"这个脏活的标准化问题。它把各家私有的胶水代码换成一个开放协议，价值核心在组合性：工具生态每多一个 server，你的 Agent 就多一批能力，而宿主侧一行代码不用改。它并不神秘，本质是给模型装了一个带规范的通用接口。建议从身边一个真实的小需求入手写一个 server，比读十篇介绍文章有用得多。
+## 总结
+
+MCP 没有魔法，它做的事情是把"模型如何获取上下文和工具"这件事标准化。对写 Agent 的人来说，它是减少重复集成的插件规范；对工具提供方来说，它是被所有兼容宿主直接使用的分发渠道。协议本身很薄，真正决定体验的，是你暴露给模型的每一个工具描述和权限设计。建议从一个小而窄的只读工具开始，把整条链路跑通再逐步扩展。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/6779d10be57796dd.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/16fed64d026e8d9e.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/efa164c16f1053d5.png)
-
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/f32caf680ef88467.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/fa007562b828f8c1.png)
 
