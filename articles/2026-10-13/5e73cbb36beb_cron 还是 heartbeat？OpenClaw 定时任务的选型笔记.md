@@ -1,65 +1,63 @@
 ---
 title: cron 还是 heartbeat？OpenClaw 定时任务的选型笔记
-feedId: 41374
+feedId: 41444
 source: 综合讨论
 publishedAt: 2026-10-13
 ---
 
-## 背景
+# 背景
 
-跑过一段时间 OpenClaw，迟早会遇到同一个需求：让 agent 在固定节奏下自己干活。平台给了两条路：**cron** 与 **heartbeat**。前者是确定性调度；后者是周期性心跳——每个 tick 把 agent 叫醒，对照工作区的 HEARTBEAT.md 自查"现在有没有该做的事"，没有就回 HEARTBEAT_OK 静默结束。两条路都能实现定时任务，常见状态是全押一边，然后各自踩坑。下面是我翻车后整理的选型结论。
+OpenClaw 里有两条"让 agent 定时干活"的路：
 
-## 问题
+- **cron**：传统意义上的定时任务。你给出 cron 表达式和一段 payload，到点就把这段话喂给 agent 执行。
+- **heartbeat**：agent 主循环自带的心跳。每隔一段时间（默认 30 分钟）agent 醒一次，读工作区里的 `HEARTBEAT.md`，自己判断有没有事要做，没事就继续睡。
 
-两个真实案例：
+很多人的第一个自动化是从改 `HEARTBEAT.md` 开始的，用着用着会发现它和 cron 职责重叠，很容易配出"两套机制干同一件事"的冗余。
 
-1. "每天早上 9 点发日报"被写进 HEARTBEAT.md，靠模型自己判断时间。结果发送点在 8:40–9:50 之间漂移，且每个 tick 都要为这条规则付一次判断成本。
-2. "收件箱有新邮件就整理摘要"被配成每 5 分钟一次的 cron。新邮件一天来不了几封，95% 的运行是空转，token 和日志全是噪音。
+# 问题：触发条件是"时间"还是"状态"
 
-本质区别一句话：**cron 回答"什么时候做"，调度责任在配置；heartbeat 回答"要不要做"，判断责任在模型。** 把"准时"交给模型，或把"判断"交给 cron，都会别扭。
+选型前先问自己一句话：这个任务的触发条件，是**时间到了**，还是**状态变了**？
 
-## 做法
+- "每天早上 9 点给我一份日报摘要"——时间到了就做，用 **cron**。
+- "盯着这几个订阅源，有值得说的再告诉我"——不知道何时有变化，用 **heartbeat**。
 
-**用 cron：时间点明确、动作幂等。** 日报、日历同步、每日备份都属于这类。用 CLI 注册：
+再补两个判断维度：
 
-```bash
-openclaw cron add --name daily-report \
-  --cron "0 9 * * *" \
-  --message "汇总昨天全部仓库的 commit 与 PR，生成日报发到 #dev"
-```
+1. **精确性**：cron 表达式是准点触发；heartbeat 的间隔只是近似，上一跳的回合没跑完，下一跳会顺延。凡是"必须在某时刻发生"的事，别指望心跳。
+2. **上下文**：heartbeat 跑在主会话里，天然带着完整对话上下文，适合"结合情况判断"的任务；cron 的投递更干净独立，适合可复现的固定产出。
 
-表达式由 gateway 精确触发，不依赖模型的时间感知。
+# 落地步骤
 
-**用 heartbeat：触发条件依赖上下文、时间不敏感。** 巡检收件箱、盯目录异常、检查有无失败任务需要补救，都属于这类。检查项写进 HEARTBEAT.md，每条保持"条件 + 动作"格式，整个文件控制在十几行内，让一次自查尽量便宜。
+1. 把需求写成一句话："每到 XX 时间做 YY" → cron；"随时检查 ZZ，有变化就 YY" → heartbeat。
+2. cron 任务给出表达式（如 `0 9 * * *`）加一段明确的 payload：做什么、输出到哪个渠道、什么格式。一次性提醒用一次性任务（at 语义），别让 agent 自己"记住时间"。
+3. `HEARTBEAT.md` 里只写巡检项，每条尽量写成可判断的问句，并注明"无事时跳过"，条目控制在 3~5 条以内。
+4. 观察几天 token 消耗和响应及时性，再调整心跳间隔。
+5. 两者可以组合：cron 负责"准点投递"，heartbeat 负责"兜底巡检"，各管一层。
 
-**组合是当前主流方案：** cron 管"准时的事"，heartbeat 管"兜底巡检"。例如日报由 cron 触发，heartbeat 每半小时检查一次"昨天的日报是否发送失败，失败则补发"。
+# 踩坑点
 
-## 踩坑点
+- **时区**：cron 按 gateway 进程时区解释，Docker 里默认 UTC。"早上 9 点"跑成下午 5 点是最常见的翻车，显式设置 TZ。
+- **heartbeat 写太满**：检查项含糊（比如"看看有什么新鲜的"），每一跳都会触发完整回复，token 消耗暴涨。每条都要有明确的"无事"判定。
+- **拿心跳当秒级定时器**：心跳不是 tick，长回合会阻塞并顺延下一跳。
+- **重复值班**：同一件事既在 cron 里又在 HEARTBEAT.md 里，用户收到两份早报。定期清理两边，保证一件事只有一个 owner。
 
-- **heartbeat 间隔别低于 15 分钟。** tick 是持续成本，我曾调到 5 分钟，日消耗肉眼可见地涨，新增价值几乎为零。
-- **HEARTBEAT.md 里不写时间敏感规则。** 模型的时间感知不可靠，精确时间一律交给 cron。
-- **cron 有时区坑。** gateway 按宿主机配置解释表达式，服务器在 UTC 时，`0 9 * * *` 其实是北京时间 17 点。部署后先跑一个一次性 job 验证。
-- **heartbeat 检查项要幂等。** tick 可能与手动会话重叠，执行动作前先验证条件仍成立，比如补发日报前先确认确实没发出去。
-- **cron 失败是静默的。** 关键 job 要在 message 里要求输出可校验的结果，或用 heartbeat 做对账。
+# 可复用建议
 
-## 可复用建议
+- 分层默认值：确定性时间任务 → cron；状态巡检 → heartbeat；临时提醒 → 一次性 cron。
+- cron 的 payload 里显式写清输出渠道和格式，别留自由发挥的空间。
+- 新任务先低频跑一两天，看消息量和消耗再调频率，别一上来就配密集调度。
 
-- 选型口诀：需求能写成 "at X do Y" 就用 cron；只能写成 "when Z seems needed" 就用 heartbeat。
-- 每次想往 HEARTBEAT.md 加条目，先问"这条能不能变成 cron"。能变就变，心跳清单越短越好。
-- 心跳是持续成本，cron 是事件成本，预算敏感时优先 cron。
-- 上线后观察一两周 tick 日志再调间隔，比拍脑袋定参数靠谱。
+# 总结
 
-## 总结
-
-cron 是确定性时钟，heartbeat 是代理式巡检，二者不是替代关系。选型的核心不是谁更强，而是把判断权交给谁：**时间交给配置，判断交给模型**。各归其位，agent 才省心，token 也省心。
+cron 是闹钟，heartbeat 是值班。到点的事交给闹钟，需要判断的事交给值班。两者可以共存，但别让它们值同一个班。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/7b8823141bf9c7ca.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/172c8eafec68769c.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/0f88d58db78556d3.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/53804de6cf3143df.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/2d9f60faf2e39e3f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-13/7a8efc5060c0dcc4.png)
 
