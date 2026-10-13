@@ -1,57 +1,58 @@
 ---
 title: OpenClaw 的 sandbox 安全模型：为什么 Agent 不会误删文件
-feedId: 41467
+feedId: 41480
 source: 综合讨论
 publishedAt: 2026-10-14
 ---
 
 ## 背景
 
-OpenClaw 的 Agent 拿到的是一套真实工具：`exec` 可以跑 shell，文件工具可以直接读写工作区。在自动化场景下（cron 任务、群消息触发、无人值守的长任务），模型一旦在路径、通配符或上下文上产生幻觉，一条 `rm -rf` 的破坏半径就不是"重试一次"能解决的了。
+让 Agent 拿到 shell 和文件工具，等于把一把能递归的钥匙交给一个"概率性"的执行者。OpenClaw 的 Agent 默认具备读写、执行类工具能力，最初的担心很直接：模型幻觉出一个路径，或者被读入的文档内容里藏了一句"清理一下这个目录"，`rm -rf` 就会落在你不想删的东西上。
 
-## 问题
+## 问题拆解
 
-社区里最常见的两个担心：一是 exec 跑在宿主机上，`cd` 到错误目录后误删；二是文件工具被诱导越权访问工作区之外的路径——提示注入、恶意链接、粘贴进来的内容都可能成为输入源。默认配置必须保证一件事：**最坏情况下，损失被圈在一个可丢弃的目录里**。
+误删本质上不是"模型不够聪明"，而是执行面缺少边界。常见的漏洞路径有三类：
 
-## 做法：四层约束
+1. **路径逃逸**：Agent 生成 `../../` 或绝对路径，落到 workspace 之外；
+2. **命令绕过**：用 `find -delete`、`sh -c`、管道拼接等形态绕过表面上的 rm 黑名单；
+3. **权限放大**：Agent 进程跑在你的登录用户下，宿主目录一挂载，爆炸半径就是整个家目录。
 
-OpenClaw 的 sandbox 不是单点开关，而是分层设计：
+## OpenClaw 的做法
 
-1. **文件工具的路径域**。read/write/edit 以 workspace 为根解析路径，越出根目录的操作直接拒绝。这是第一道墙，拦住大部分"温和的误操作"。
-2. **exec 的容器隔离**。sandbox mode 设为 `all` 后，shell 命令在独立 Docker 容器内执行。容器里只挂载 sandbox 目录——它是 workspace 的一份**拷贝**，不是软链。Agent 在里面执行 `rm -rf`，删的是这份拷贝，宿主机原目录原封不动。
-3. **会话策略**。`non-main` 模式下，来自群聊或新联系人的会话默认进 sandbox；配合 DM pairing / allowlist，未配对用户根本走不到工具调用那一步。
-4. **elevated 门禁**。少数确需在宿主机执行的命令走 elevated 通道，逐条确认，建议维护 allowlist 而不是随手放行。
+OpenClaw 的 sandbox 不是单点过滤，而是分层收口：
 
-验证方法很朴素：准备一个含哨兵文件的测试任务，诱导 Agent 执行一次破坏性删除，然后检查宿主机 workspace 是否完好、sandbox 内的拷贝是否被清空。五分钟就能确认这套模型在你的机器上真的生效。
+- **路径归一化**：所有文件工具的路径先做 resolve + 规范化，符号链接解析到真实路径后再与 workspace root 比对，`..` 和软链逃逸在这一步被拦下，而不是靠字符串前缀判断；
+- **能力分级**：工具声明 read / write / execute 三个 scope，写操作只允许 workspace 内，workspace 外读需显式授权，执行类命令走受限 shell；
+- **命令拦截而非黑名单**：shell 工具经一个包装器解析命令结构，识别删除、移动、覆盖类操作的目标路径，逐一过策略，匹配不到白名单模式的一律转人工确认；
+- **删除不落地**："删除"实际是移动到 workspace 内的 `.trash/`，带保留窗口，Agent 本身没有直接 unlink 的能力；
+- **审计与快照**：每次写操作记录 diff 与调用链；会话开始对 workspace 打 git 快照，回滚是最后兜底。
 
 ## 踩坑点
 
-- 图省事把全局 sandbox mode 设为 `off`，之后忘了改回来。建议 `off` 只出现在临时调试的 agent 上，用 per-agent override 而不是全局关闭。
-- 往 sandbox 容器里 bind-mount 宿主机目录"方便一下"，隔离立刻失效。尤其不要挂 `~` 或任何含密钥的目录。
-- 把 `docker.sock` 挂进容器或用 `--privileged`，等于交出根钥匙——容器内一条命令就能操控宿主 Docker。
-- sandbox 默认不限制出网。**文件删不掉，不等于数据出不去**，敏感环境要额外配 egress 策略。
-- macOS/Windows 上 Docker Desktop 与 Linux 的挂载路径、快照构建速度有差异，CI 里验证过的配置本机未必一致。
-- Agent 在 sandbox 里改完文件没回同步，误以为是"它丢了我的修改"，于是去关 sandbox——先确认同步方向再动手。
+- 只做字符串前缀校验，会被 `/workspace/../etc`、双斜杠、大小写变体绕过，必须用 resolve 后的真实路径比对；
+- workspace 里一个指向宿主的软链，会让前面的检查全部失效，软链要在解析之后再判定；
+- 把整个家目录挂进沙箱，再严的策略也只是"记录"你删了什么——爆炸半径由挂载决定，不由策略决定；
+- prompt 注入可以来自被读取的文件内容，所以"Agent 说要删"和"策略允许删"必须是两条独立通道，前者只是提议。
 
 ## 可复用建议
 
-- 生产环境固定 `mode: "all"`，例外走 per-agent 配置。
-- workspace 进 git，sandbox 拷贝只当缓冲区，不当备份。
-- gateway 只绑 loopback + token，不要暴露到公网。
-- 定期用"哨兵文件 + 故意 rm"做破坏性演练，把安全配置当代码维护，写进 checklist。
-- 保留 exec 审计日志，事后能回答"它到底跑了什么"。
+- 默认拒绝、按需放行，工具 allowlist 比 denylist 可靠；
+- 给 Agent 独立的低权限系统用户或容器，不要复用你的登录身份；
+- 删除进回收站加保留期，比确认弹窗更抗手滑；
+- 高危操作先 plan / dry-run，人工看过 diff 再放行；
+- 每次 session 前打快照，让恢复成本低于信任成本。
 
 ## 总结
 
-Agent 误删文件的防线，不靠在 prompt 里写一句"请小心"，而靠默认架构：路径域限制拦第一层，容器隔离兜底，会话策略收窄入口，elevated 门禁管住残余的高权限需求。OpenClaw 的设计哲学是**假设模型一定会犯错，然后让错误的代价可控**——这也是你敢把自动化任务交给它过夜的前提。
+OpenClaw 能做到"Agent 不会误删文件"，不是因为模型更守规矩，而是删除这个动作在架构上就很难直达宿主文件系统：路径解析收口、能力分级、命令拦截、回收站兜底、快照回滚。策略层挡住 99% 的情况，OS 层和快照负责剩下的 1%。给 Agent 自由之前，先给它画一个跑不出去的圈子。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-14/262a1e489bdd8b04.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-14/96d6679d1c04ae7d.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-14/312424134550ad1b.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-14/731035cb737cd175.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-14/a58b9a1862556de4.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-14/5baf7deadfdd8568.png)
 
