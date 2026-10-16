@@ -1,58 +1,61 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 41732
+feedId: 41766
 source: 综合讨论
 publishedAt: 2026-10-17
 ---
 
 ## 背景
 
-OpenClaw 用得越久，攒下来的能力越多：日报生成、内网巡检、播客转写、发布检查……最早的方案是把所有操作手册塞进系统提示词，结果上下文越滚越长，单轮 token 消耗上涨，模型选错工具的概率反而变高。
+OpenClaw 的 Agent 长期运行时面对的是一个有限的上下文窗口。早期的做法是把所有工具说明、操作手册全部塞进系统提示词，结果是上下文很快被占满，模型注意力被稀释，简单对话也变得又慢又贵。
 
-Skills 机制给出的解法是**渐进式披露**：常驻上下文里只保留每条技能的 `name` 和 `description`，正文（步骤、脚本路径、注意事项）在模型判断当前任务相关时才加载。相当于把能力从"全部随身携带"改成"建一个可检索的仓库"。
+Skills 机制借鉴了渐进式披露（progressive disclosure）的思路：技能平时只以「名字 + 一句描述」的形式存在于上下文中，只有当 Agent 判断当前任务相关时，才加载完整的 SKILL.md 正文。本质上是给能力做懒加载。
 
 ## 问题
 
-实际跑下来有两类反面模式：
+按需加载成立的前提是「触发得准」。实践中常见三个矛盾：
 
-1. **手册全量进提示词。** AGENTS.md 写到几百行，任何一轮对话都要为其买单，且注意力被稀释。
-2. **万物皆 MCP。** 很多能力并不需要新工具，只是一套操作指引——把"说明文"包装成工具，反而让工具列表变得难选。
+1. 描述写得太泛，技能永远不被触发；写得太窄，又会错过相邻场景。
+2. 技能数量多了以后，描述列表本身也在吃上下文预算。
+3. 技能与 MCP 工具、内置命令职责重叠，Agent 不知道该信谁。
 
-## 做法 / 步骤
+## 做法
 
-1. **建 skill**：在 workspace 的 `skills/` 目录下为每个能力建文件夹，核心是 `SKILL.md`，frontmatter 写 `name` 和 `description`，正文写操作步骤。
-2. **把 description 当触发面写**：说清"什么场景用、输入是什么、依赖哪些命令"，一两句即可。这是模型唯一常驻可见的部分，决定技能会不会被选中。
-3. **声明依赖**：在 `metadata.openclaw.requires` 里写清 `bins`、`env`、`config`，环境不满足的技能不进候选池，避免模型调用注定失败的东西。
-4. **区分常驻与按需**：核心工作流可加 `always: true` 常驻，其余一律按需，常驻数量控制在两三条以内。
-5. **显式验证再放手**：新 skill 先用 `/skill <name>` 手动加载，确认正文和脚本路径无误，再让模型自动触发。
-6. **脚本外置**：脚本放 skill 目录里，正文只写路径和调用方式，不要把代码内联进 SKILL.md。
+以添加一个自定义技能为例：
+
+1. **建目录**。在 `~/.openclaw/workspace/skills/` 下建文件夹，比如 `git-release-helper/`，工作区技能会随会话自动被发现。
+2. **写 SKILL.md**。YAML frontmatter 里必须有 `name` 和 `description`。description 是路由的关键，建议写成「什么时候用我 + 能做什么」，例如：「当用户要求整理提交记录、生成发布说明或打 tag 时使用。调用本地 git 完成分支整理与变更汇总。」
+3. **正文写操作手册**。正文只在被触发时进入上下文，可以放开写：步骤、边界条件、失败回退。几百行以内为宜，脚本放同目录，正文里引用相对路径。
+4. **依赖门控**。技能如果依赖某个 CLI（如 `gh`），在 frontmatter 的 `metadata.requires.bins` 里声明；环境缺失时 OpenClaw 会把技能标记为不可用，而不是让 Agent 半路报错。
+5. **装别人的技能**。`clawhub search / install` 从社区仓库安装，装完重启会话生效。第三方技能建议先通读正文再启用，重点检查有没有让它联网上传或写敏感文件的步骤。
+
+与 MCP 的分工：MCP 提供工具接口（API 层），Skills 提供流程知识（什么时候、按什么顺序调）。我们的经验是——能用现有 MCP 工具拼出来的流程，写成 skill，而不是再造一个 server。
 
 ## 踩坑点
 
-- **description 太笼统 → 永远不触发；关键词堆太多 → 什么场景都抢着触发。** 写完拿真实任务测：直接问 agent"这个问题你会用哪个 skill"，观察它的判断依据。
-- **技能静默消失。** `requires.env` 配了但变量没注入，技能会从候选中隐藏，表现为"写好的 skill 找不到了"。先用 `/skills list` 确认可见性再排查。
-- **改完不生效。** SKILL.md 的修改通常要新开会话（或重载）才会被读到。
-- **三层同名覆盖。** workspace、managed、bundled 三个位置可能出现同名 skill，优先级覆盖会让"我明明改了"变成排查黑洞，先确认命中的是哪一份。
-- **别把 MCP 和 Skills 对立。** MCP 适合结构化工具调用，Skills 适合沉淀流程经验；skill 正文里完全可以指导模型去调某个 MCP 工具，两者是互补关系。
+- **描述里没有触发词**。写「帮我处理 git 的事」这种描述，Agent 匹配不上用户原话。要写用户实际会说出的词：release notes、changelog、打标签。
+- **改了 SKILL.md 不生效**。多数情况是旧会话仍持有缓存，新开会话或重启 gateway 即可。
+- **正文写成小作文**。触发后整段进入上下文，过长反而拖慢响应。把细节拆到附属文件，正文只留决策主干。
+- **命名冲突**。自定义技能与内置技能同名时，加载顺序不一定如你所愿，加个人前缀最省心。
 
 ## 可复用建议
 
-- 一个 skill 只做一件事，正文超过两三百行就该拆。
-- workspace skills 用 git 管理，改动可回溯、可同步。
-- 定期审计：把所有 description 拉出来读一遍，删掉长期没触发过的。
-- 团队共用的 skill，写清前置条件比写清步骤更重要——前置不满足的技能宁可不出现。
+- 一个技能只解决一类任务，宁可拆两个，不要做成大而全。
+- 把 description 当作检索 key 来打磨，用真实请求反复测触发率。
+- 团队协作时把 skills 目录纳入 git，技能变更像代码一样走 PR 评审。
+- 定期清点：半年没触发过的技能直接删，描述列表的每一行都是成本。
 
 ## 总结
 
-Skills 的价值不在"多"，在"按需"。把常驻上下文当预算花：description 是货架标签，正文是仓库里的货物，`requires` 是入库质检。写 skill 的本质，是给未来的自己和团队写一份能被 agent 主动检索到的 runbook——这份投入会在每一次自动触发里还回来。
+Skills 机制的价值不在「能装插件」，而在把上下文预算从静态堆料改成动态调度。写好一句 description，比堆十个技能更有效。建议从一两个真实高频任务起步，先跑通「触发—加载—执行」闭环，再考虑规模化。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/dbe24b88be4e9d9f.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/5ac5a2ed69fbc3cc.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/5ad97386c6101ab1.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/1f962779fa648a47.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/1553945292c6a425.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/360a5520b6c730ab.png)
 
