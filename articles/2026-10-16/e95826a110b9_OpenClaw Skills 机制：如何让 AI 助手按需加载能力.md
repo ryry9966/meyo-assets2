@@ -1,75 +1,69 @@
 ---
 title: OpenClaw Skills 机制：如何让 AI 助手按需加载能力
-feedId: 41638
+feedId: 41728
 source: 综合讨论
 publishedAt: 2026-10-16
 ---
 
+# OpenClaw Skills 机制：如何让 AI 助手按需加载能力
+
 ## 背景
 
-跑过一段时间 Agent 的人都有体感：能力越多，system prompt 越臃肿。早期的常见做法是把所有工具说明、操作手册全量塞进上下文，结果 token 成本线性上涨，模型注意力被稀释，反而更容易答非所问。OpenClaw 的 Skills 机制就是针对这个问题：把能力拆成一个个独立技能包，平时只暴露一句话摘要，用到时才加载正文。
+做 Agent 常见的一步错棋：把所有能力说明全部塞进系统提示词。三五个工具时没问题，攒到二三十个，每次会话开头就固定背上几万 token——大部分能力一整周用不上一次，却始终在线。OpenClaw 的 Skills 机制把这个问题变成了文件组织问题：能力写成独立文件夹，按需加载。
 
-## 问题
+## 机制拆解
 
-我们想要的效果很朴素：常驻上下文里只保留最小路由信息，同时保证模型在真正干活时能拿到完整操作指引——该调哪个 CLI、参数怎么填、失败怎么兜底。全量加载和完全不加载之间，需要一个按需加载的中间层。
+一个技能就是一个目录：
 
-## 做法
-
-Skills 的本质是一个文件夹加一份 SKILL.md，加载分三层：
-
-1. **会话启动**：只有 frontmatter 里的 `name` 和 `description` 进入系统提示词，单个技能成本几十 token；
-2. **触发加载**：模型判断当前任务匹配某技能时，才把 SKILL.md 正文注入上下文；
-3. **按需深读**：正文里引用的附属文件（模板、示例、参考文档）再按需读取。
-
-一个最小可用技能长这样：
-
-```markdown
----
-name: pdf-extract
-description: 从本地 PDF 提取文本与表格。当用户提到 PDF、发票、扫描件的解析或汇总时使用。
-metadata:
-  os: [darwin, linux]
-  requires:
-    bins: [pdftotext]
----
-
-## 步骤
-1. 用 pdftotext -layout 保留排版提取
-2. 扫描件先判断是否需要 OCR
-3. 输出统一为 markdown 表格，无法识别的字段标 TODO
+```
+my-skill/
+├── SKILL.md        # frontmatter(name, description) + 正文指令
+├── scripts/        # 可选，可执行脚本
+└── references/     # 可选，详细文档
 ```
 
-放到工作区 `skills/` 目录或 `~/.openclaw/skills/` 即可，插件也可以携带技能。用 `openclaw skills list` 查看加载与 gating 状态，`skills info <name>` 会告诉你技能为什么被拦：缺二进制、缺环境变量或 OS 不匹配。
+核心是渐进式加载，分三层：
 
-`requires` 是关键设计：声明依赖后，环境不满足的技能直接不进路由，避免模型拿着不存在的工具瞎编命令。
+1. 会话启动时，只注入所有技能的 name 和 description，每个几十 token，几十个技能开销也可控；
+2. 模型判断当前任务匹配某个 description，主动 read 对应的 SKILL.md 拿到完整指令；
+3. SKILL.md 里引用的脚本和文档，只在真正执行那一步才被读取。
+
+也就是说，上下文里常驻的只是"目录页"，正文和附件全部懒加载。
+
+## 上手步骤
+
+1. 在技能目录（`~/.openclaw/skills` 或 workspace 下的 skills 文件夹）新建子目录；
+2. 写 SKILL.md：frontmatter 填 name 和 description，正文写操作步骤、约束和边界情况；
+3. 有确定性流程就丢进 scripts/，让技能调用脚本，而不是用自然语言复述算法；
+4. 重启会话（或触发重新扫描），用真实任务问一遍，观察它是否读了这个技能、读的时机对不对。
 
 ## 踩坑点
 
-1. **description 写成宣传语**。它是路由依据，不是广告位。"强大的文档处理工具"这种描述基本不会触发；写清楚"做什么 + 什么场景用 + 用户会说什么词"才有效。
-2. **一个巨型技能包打天下**。十几个不相关操作堆进一个 SKILL.md，触发条件模糊，正文过长还会稀释指令。按职责拆小。
-3. **该做 MCP 的做成了 Skill**。需要 schema 校验、结构化返回、跨客户端复用的能力，MCP server 更合适；Skill 擅长的是流程性知识——教模型按什么顺序调 CLI、怎么处理边界情况。
-4. **忽略正文是按需注入的**。不要假设模型时刻记得技能细节；但同会话内一旦加载就常驻，多个技能间别重复写大段相同内容。
-5. **依赖没 gate**。不写 `requires` 时，环境里没有 pdftotext，模型会硬编一个近似命令，报错信息非常有迷惑性。
+- **description 写成功能简介而不是触发条件。**"用来处理文档"召不回，"当用户要求把网页转成 PDF 并发送邮件时使用"才召回。把它当检索 query 写，塞进用户真实会说的话。
+- **description 太宽泛。**一个叫"处理文件"的技能会抢走本该属于其他技能的任务。
+- **职责重叠的技能并存**，模型的选择接近抽签，先合并再拆分。
+- **关键约束只在聊天里说过一次**，没写进 SKILL.md——下次会话等于没说。
+- **脚本依赖没装、路径写死**，技能在被调用的那一刻才暴露问题。
+- **SKILL.md 本身写了几千行**，加载一次就把省下来的上下文吃回去了。
 
 ## 可复用建议
 
-- description 公式：能力一句话 + 触发场景 + 触发关键词，控制在两行内；
-- 从最小 SKILL.md 起步，跑几天真实对话，观察"该触发没触发 / 不该触发乱触发"，再迭代正文；
-- skills 目录进 git，改动可回溯，团队可共享；
-- 定期用 `skills list` 审计，删掉长期没触发过的技能；
-- Skill 管流程、MCP 管工具，两者组合使用：Skill 正文里直接引用 MCP 工具名，是常见且顺手的写法。
+- 一个技能只做一件事，内部再按 references/ 分层；正文控制在几百行内，长细节外链；
+- 确定性步骤一律脚本化，自然语言只负责"何时用、注意什么"；
+- 不想从零写，可以先从 ClawHub 拉几个现成技能读源码，看别人怎么组织 description，再魔改成自己的；
+- 每次改动后用真实对话回归一遍，盯日志确认"召回 → 读取 → 执行"链路完整，别只看"看起来能跑"。
 
 ## 总结
 
-Skills 解决的不是"能力从哪来"，而是"能力何时进上下文"。把路由信息做到极致地小，把操作知识做到恰好够用，Agent 的上下文才能长期保持干净。如果你已经在用 MCP 和插件，值得花半小时把自己重复用的几段 prompt 固化成技能包——这笔投入的收益会随时间复利。
+Skills 的本质是上下文的懒加载：把"提示词工程"降维成"文件怎么摆"。写得好的技能库，上下文占用低、触发准、可版本管理、可分享；写得差的，不过是把 prompt 拆成了很多个文件。差别就在 description 的写法和分层粒度上——这两处值得反复迭代。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-16/246def621778e213.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-16/73e2880677ea74e4.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-16/e99767c2fa434cd4.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-16/e4920011c9ca79e8.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-16/615c65cba7720830.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-16/f492a8cee89e318c.png)
 
