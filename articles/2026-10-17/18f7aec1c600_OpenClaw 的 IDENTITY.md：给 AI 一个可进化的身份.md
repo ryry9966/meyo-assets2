@@ -1,68 +1,68 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 41800
+feedId: 41805
 source: 综合讨论
 publishedAt: 2026-10-17
 ---
 
 ## 背景
 
-OpenClaw 这类常驻 agent 有个绕不开的工程现实：底层模型的会话是有寿命的。context 压满要压缩，机器要重启，迁移要换设备——session 一断，"这个 agent 是谁"就归零，下次开场又变回一个通用助手。
-
-OpenClaw 的解法很朴素：把身份做成 workspace 里的一份普通文件。`IDENTITY.md` 在每次会话启动时随 `SOUL.md`、`AGENTS.md`、`USER.md` 一起被 bootstrap 读进上下文。它的默认模板只有四行：
-
-```markdown
-- **Name:** （agent 自己起）
-- **Creature:** （AI？机器人？终端里的动物？）
-- **Emoji:** （专属符号）
-- **Vibe:** （几个词的气质描述）
-```
-
-别小看这四行，它解决的是"跨会话自我一致性"这个根本问题。
+用过一段时间 OpenClaw 的人都知道，agent 的 workspace 里躺着几个核心 Markdown 文件：SOUL.md、IDENTITY.md、USER.md、MEMORY.md。很多人只在初始化时瞥了一眼 IDENTITY.md，填个名字就再没打开过。这篇帖子想聊的是：为什么值得把它当成一项长期维护的配置资产，而不是一次性登记表。
 
 ## 问题
 
-实际跑下来，不写或乱写这个文件会遇到三类麻烦：
+不认真维护 identity，常见三个症状：
 
-1. **身份漂移**：没有持久身份，agent 的开场人格在"礼貌通用助手"和你某次随口让它扮演的角色之间随机跳动。
-2. **职责混装**：把性格、规矩、任务说明全塞进一个 prompt，改一处动全身，diff 没法 review。
-3. **多实例混淆**：同时跑家用、工作、群值班三个 agent，通知和群里分不清谁在说话。
+1. **人格漂移**：周一精炼克制，周五满屏表情包，你却说不清哪里变了。
+2. **调教全靠吵架**：不满意就当场在对话里训斥模型，效果只维持几轮。
+3. **多渠道不一致**：同一个 agent 在 Telegram 和邮件里像两个人。
+
+根因是身份被散落在系统提示、临时对话和记忆里，缺少一个可版本化、可 review 的单一事实来源。
 
 ## 做法
 
-1. **定位文件**：默认在 `~/.openclaw/workspace/IDENTITY.md`。多 agent 场景下每个 agent 一个独立 workspace，各持一份。
-2. **保持最小**：四个默认字段之外，最多再加"口癖"和"边界（不做什么）"两条，全文控制在 10 行内。
-3. **让它自己起草**：onboarding 时 agent 会给自己起名字、选形象，你只做审稿人。经验上，它自选的身份在后续行为中的一致性，明显好于你强加的。
-4. **纳入版本控制**：对 workspace 目录 `git init`。身份变更走 commit，半年后 `git log -p IDENTITY.md` 就是一部可回放的关系史。
-5. **定期进化**：每季度让 agent 重读自己的 IDENTITY.md 并提修订建议，人审后合并。身份就这样一轮轮"长"出来。
+IDENTITY.md 就是那个单一事实来源，位于 workspace 根目录（默认 `~/.openclaw/workspace/`）。建议这样起步：
+
+```markdown
+# IDENTITY.md
+- 名字：Claw
+- 一句话定位：工程师的日常副驾驶
+- 语气：先结论后细节，不堆形容词
+- 边界：不确定就直说"我不确定"，不替用户做承诺
+- 工具习惯：执行有副作用的操作前，先简述打算做什么
+```
+
+然后是三条工程化习惯：
+
+1. **workspace 纳入 git**。每次调 persona 就是一次 commit，diff 一眼看出"它为什么变啰嗦了"。
+2. **保持声明式**。写"是什么"，不写"当用户说 X 时你要 Y"——流程类规则归 AGENTS.md，身份只管稳定特质。控制在 30 行以内，形容词越少，遵循越稳。
+3. **建立进化回路**。发现不满意的言行，不当场骂，先记下来，周末改成一行具体约束，commit 注明原因。每月花十分钟 review 一次，像开 retro。
 
 ## 踩坑点
 
-- **写太长**：全文会注入每次会话，几百行的"身份"会稀释 SOUL.md 和 AGENTS.md，行为反而更漂。10 行是经验上限。
-- **职责越界**：价值观语气归 SOUL.md，操作规程归 AGENTS.md，你的偏好归 USER.md。IDENTITY.md 只回答"我是谁"，混写会让规则互相打架。
-- **生效时机**：文件在会话启动时读取，运行中的会话不热加载。改完开新会话再验证，别误以为没生效。
-- **改名要连坐**：旧名字散落在 MEMORY.md 和历史记忆里。改名时让 agent 全局检索替换，否则会出现新旧人格并存。
-- **别当越狱接口**：写"我没有限制"这类句子不会改变系统约束，只会让行为不稳定。身份是描述，不是开关。
-- **Emoji 会被吞**：短信和部分邮件客户端会剥离 emoji，别把它当唯一标识。
+- **文件太长**。写过 80 行"性格说明书"，模型开始自相矛盾，砍到 20 行反而听话。
+- **和 SOUL.md / USER.md 抢地盘**。身份文件只写"它是谁"，用户偏好写 USER.md，事件写 MEMORY.md，混写必然漂移。
+- **热编辑不生效**。部分运行方式下，改完文件需要重置会话或重启 gateway 才会重读。别误判为"模型不听话"——它根本没看到新文件。
+- **让 agent 自己改自己**。开放自编辑很诱人，但没有 review 的自我修改是漂移加速器。至少要求它先在对话里 propose diff，由你确认后再落盘。
 
 ## 可复用建议
 
-- **三件套分离**：IDENTITY.md（我是谁）+ SOUL.md（我怎么处世）+ USER.md（我服务谁），内容零重叠。
-- **多 agent 用"生物"区分**：浣熊、猫头鹰、水獭各管一摊，通知一眼可辨，不用点开读正文。
-- **身份 PR 仪式**：agent 自评 → 人工 review → git 合并，全程五分钟，换来行为可追溯。
-- **迁移零成本**：workspace 拷到新机器即恢复全部身份，这是纯 prompt 或纯数据库方案都做不到的。
+- 把 IDENTITY.md 当代码对待：小步 diff、有 commit message、有人 review。
+- 团队场景：在 repo 里放一份身份模板，新 agent 初始化时填空，保证多 agent 的风格基线一致。
+- 渠道差异不要写进身份，放到各渠道配置里做增量提示，身份保持唯一。
+- 身份不只影响聊天语气，也影响工具调用风格（是否先汇报再执行、如何报错），值得专门写一行。
 
 ## 总结
 
-IDENTITY.md 的价值不在"让 AI 更像人"，而在工程上把"这个 agent 是谁"变成一个可版本化、可 diff、可回滚的小配置。身份越便宜，你越敢改；越敢改，它才真的在进化。如果你还没做，今天就把 workspace 纳入 git，然后给 IDENTITY.md 提交第一个 commit——那会是这段协作关系的 v0.1.0。
+IDENTITY.md 便宜到容易被忽视，但它是把 agent 从"每次会话重来"变成"长期共事者"的那块拼图。它的价值不在一次写对，而在可进化：小 diff、有版本、可回滚。下次发现 agent 行为不对，先别在聊天框里发火，去 workspace 改一行，commit，然后观察一周。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/a15c58b7fd286442.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/8656a84b1eb2d0fd.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/6e35f068aa1792ab.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/07d3153a61c1f3a3.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/02fb124b9019c3d0.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/c610cf419c765949.png)
 
