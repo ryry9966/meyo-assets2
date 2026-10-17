@@ -1,72 +1,73 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 41806
+feedId: 41812
 source: 综合讨论
 publishedAt: 2026-10-17
 ---
 
 ## 背景
 
-过去一年做 Agent 落地的人大概都经历过类似的场景：模型能力够了，卡在工具层。想让 Agent 查数据库、调内部 API、操作文件系统，每接一个模型、每换一个框架，工具接入代码都得重写一遍。Function calling 解决了“模型怎么表达要调工具”，但没解决“工具怎么以统一方式提供给模型”。这就是经典的 N×M 问题：N 个应用 × M 个数据源，每个组合都要单独写胶水代码。
+做过 Agent 插件的人大概都有类似经历：接一个新数据源，就要为当前框架写一套 tool 定义、参数校验和错误处理；换个框架，全部重来。2024 年 11 月 Anthropic 开源了 Model Context Protocol（MCP），把"模型连工具"这件事做成了公开协议。一年多下来，主流客户端和官方 SDK（Python / TypeScript）都已稳定，现在讨论它属于工程选型，不是追热点。
 
-## 问题
+## 它解决什么问题
 
-具体拆开，痛点有三个：
+本质是经典的集成问题：M 个 Agent 应用 × N 个工具/数据源，两两对接要写 M×N 份胶水代码。MCP 把它压成 M+N——应用实现一次 Client，工具实现一次 Server，中间走统一的 JSON-RPC 2.0。
 
-1. **集成重复**。同一个“查工单库”的能力，在这个客户端里写一遍，在自己的 Agent 框架里又写一遍，接口、鉴权、错误格式全都对不上。
-2. **上下文供给没有约定**。工具调用之外“把数据塞给模型”这件事，各家做法五花八门，文件、检索结果、配置的暴露方式不统一。
-3. **关注点耦合**。工具的实现、部署、鉴权和模型侧代码缠在一起，模型一换，工具层跟着返工。
+MCP Server 对外暴露三类核心原语：
 
-## 做法
+- **Tools**：模型可主动调用的动作（发请求、写文件）
+- **Resources**：可读取的上下文数据（文档、记录）
+- **Prompts**：预置的提示词模板
 
-MCP（Model Context Protocol）用 JSON-RPC 2.0 作为消息层，把这一层标准化了。核心角色只有三个：
+传输层两种：本地子进程用 stdio，远程服务用 Streamable HTTP。
 
-- **Host**：Agent 本体（桌面客户端、自研框架），内嵌 MCP Client；
-- **Server**：能力提供方，按域拆分，比如一个管数据库、一个管文件；
-- **Transport**：本地用 stdio，远程用 Streamable HTTP。
+## 最小上手路径
 
-Server 对外暴露三类原语：**Tools**（可执行操作，有副作用）、**Resources**（只读数据）、**Prompts**（预置模板）。
+1. 用 SDK 写一个最小 Server，Python 生态里 FastMCP 几行就能跑：
 
-实操下来，接入是五步：
+```python
+from fastmcp import FastMCP
 
-1. 用官方 SDK（Python / TypeScript）起一个最小 Server，先只暴露一个工具；
-2. 给每个工具写清楚 name、description、JSON Schema——这三样是模型唯一能看到的东西；
-3. 用官方 Inspector 单测 Server，不接模型先验证调用链路；
-4. 选传输方式：本地进程用 stdio，跨机器用 HTTP 加鉴权；
-5. 在 Host 侧接通：启动时拉工具列表 → 注入模型 → 模型返回调用请求 → Client 转发 Server → 结果回填上下文。
+mcp = FastMCP("weather")
 
-跑通一个之后，第二个、第三个 Server 基本就是复制结构的事。
+@mcp.tool()
+def get_weather(city: str) -> str:
+    """查询指定城市的实时天气，输入中文城市名"""
+    return lookup(city)
+
+mcp.run()
+```
+
+2. 在任意支持 MCP 的宿主（Claude Desktop 或你自己的 Agent）里注册这个 Server 的启动命令。
+3. 发起一次真实对话，观察模型是否正确选中该工具、参数是否解析对。
+
+到这里，同一个 Server 可以被任何 MCP 客户端复用，不用再为每个框架重写一遍插件格式——这就是协议带来的直接收益。
 
 ## 踩坑点
 
-几个代价比较高的坑：
-
-- **Schema 含糊，模型就乱调**。description 不是给人看的注释，是给模型的指令。`query_data` 不如 `Query the orders table by date range; returns at most 50 rows`。
-- **大返回值打爆上下文**。查库返回 200 行 JSON，一次调用吃光 token 预算。解法是 Server 侧做分页和摘要，或返回 ID 让模型按需取。
-- **stdio 模式的环境问题**。Server 依赖的 Python 环境、npx 版本和 Host 假设不一致，症状是“连不上”，实际是启动就崩。先在终端手动跑一遍 Server 启动命令。
-- **把 Server 输出当可信内容**。工具返回的网页、工单文本里可能藏注入指令，Host 侧要做隔离审查，别直接拼进系统提示词。
-- **规范在演进**。早期 SSE 传输已换成 Streamable HTTP，SDK 版本间行为有差异，锁版本、看 changelog。
-- **带副作用的工具没有确认层就是事故**。删数据、发消息类操作，Host 必须加人工确认或白名单。
+- **工具描述就是模型眼中的接口文档。**写成 "get data" 这种模糊描述，模型大概率调错或漏调。描述要讲清"什么场景用、参数含义、返回什么"。
+- **stdio 传输下 stdout 是协议通道。**在代码里随手 `print` 调试信息会污染 JSON-RPC 流，客户端表现为"连不上"。日志一律走 stderr 或文件。
+- **一次挂载 30+ 个工具，schema 会吃掉大量上下文**，同时稀释模型的选择准确率。按会话需要动态启用。
+- **远程 Server 的鉴权别裸奔**，OAuth 或 Token 至少配一样；写操作类工具建议在宿主侧加人工确认环节。
 
 ## 可复用建议
 
-- 把每个工具当成写给初级工程师的接口说明：name 说做什么，description 说什么时候用，schema 约束怎么传参。
-- 读写分离：只读查询走 Resources 思路，变更走 Tools，权限和审计分开做。
-- 一个 Server 管一个域，别做上帝 Server；鉴权、部署、日志都跟着域走。
-- 所有调用落日志：工具名、参数、耗时、返回大小，排障时全靠它。
-- 先 Inspector 验证，再接模型，最后上自动化，不要跳步。
+- **先用现成的**：Filesystem、GitHub、数据库等社区 Server 已覆盖大部分常见需求，别急着造轮子。
+- **一个 Server 只管一个领域**，工具按"能力"设计，而不是照搬内部 REST 端点。
+- **Server 侧做好结构化日志**。排查"模型为什么没调用/调错了"这类问题，基本全靠它。
+- 参数结构保持扁平简单，深层嵌套对象会显著降低调用可靠性。
 
 ## 总结
 
-MCP 不是什么智能增强，它是管道标准——把“模型怎么找工具、怎么调工具、怎么拿结果”固定下来。它的价值不体现在单次集成提速多少，而在于工具层从此可以独立于模型和框架演进，生态里写好的 Server 能直接复用。对做 Agent 自动化的人来说，与其再手写一套胶水层，不如把精力花在工具的 Schema 和返回值设计上——协议解决的是通信，好用与否仍取决于接口设计本身。
+MCP 没有什么魔法，它只是把"Agent 接工具"从各家的私有实现变成了公共协议。判断是否值得上手的标准很简单：如果工具需要在多个 Agent 或客户端之间复用，或者你打算把自己的能力开放出去给别人接入，MCP 现在就该学；如果只是单体脚本内部的一次性调用，普通函数调用就够了。先跑通最小 Server，再谈架构。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/289c6ef6e9d2d89c.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/f2f3c6f7a63e25d4.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/cfe7e27b09c78fca.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/df7b0d4bd3a9118e.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/a5311bad3ca1e8bb.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-17/97a32a1e464942fe.png)
 
