@@ -1,71 +1,67 @@
 ---
 title: OpenClaw Skills 机制：让 AI 助手按需加载能力
-feedId: 41891
+feedId: 41948
 source: 综合讨论
 publishedAt: 2026-10-18
 ---
 
 ## 背景
 
-OpenClaw 里 Agent 的行为由三样东西决定：system prompt、工具、以及 Skills。每个 Skill 是 skills 目录下的一个文件夹，核心是一份 SKILL.md，写清这个能力是干什么的、什么时候用、具体怎么做。它解决的核心问题只有一个：**上下文预算**。
+OpenClaw 的 agent 启动时只有一份系统提示和一组基础工具，真正的扩展能力来自 Skills：每个 Skill 是一个带 `SKILL.md` 的目录，YAML frontmatter 声明元信息，正文写具体操作流程。它的关键设计是**渐进披露**——启动时上下文里只注入所有 skill 的名称加一句 description 摘要，正文只在任务匹配时才被读入。理解这一点，才能把机制用对。
 
 ## 问题
 
-如果不做按需加载，常规做法是把所有能力的说明书一次性塞进 system prompt。技能一多，光说明就占掉大几万 token，真正任务的空间被挤压，而且大部分技能和本次对话毫无关系，纯属浪费。更糟的是，有些技能依赖的 CLI 或 API key 根本没装，注入了也执行不了，模型还会照着说明书反复试错。
+常见两种反模式：一是把所有操作流程塞进系统提示或 `AGENTS.md`，上下文成本高，不同流程的指令还互相干扰；二是装了一堆 skill 却从不触发，等于纯占目录。
+
+我的实际场景：想让助手在服务器上做三件事——渲染 PDF 周报、批量压缩图片、查询自建服务状态。全写进提示词约 1.5k token 常驻，而且图片压缩的指令偶尔会被错误套用到 PDF 任务上。
 
 ## 做法
 
-OpenClaw 的 Skills 走的是渐进披露（progressive disclosure）路线：
-
-1. **只注入元信息**。system prompt 里每个技能只占一两行：name + description。模型根据这两行判断本次要不要用。
-2. **按需读全文**。模型决定使用某技能后，用 read 工具拉取 SKILL.md 正文，才知道具体步骤；没触发的技能正文永远不进上下文。
-3. **依赖门控**。frontmatter 里声明 `requires.bins`（二进制依赖）、`requires.env`（环境变量）、`requires.config`（配置项），不满足条件的技能直接从候选中剔除，不污染 prompt。
-
-一个最小 SKILL.md 长这样：
+1. 建目录：`~/.openclaw/workspace/skills/pdf-report/SKILL.md`。workspace 级 skill 优先于内置版本，便于覆盖默认行为。
+2. 写 frontmatter：
 
 ```markdown
 ---
-name: pdf-extract
-description: 从 PDF 提取文本和表格，用于解析发票、报告类文件
+name: pdf-report
+description: 将 Markdown 周报渲染为 PDF 并校验；仅在用户明确要求导出 PDF 报告时使用。
 metadata:
   openclaw:
     requires:
-      bins: [pdftotext]
+      bins: [pandoc]
+      os: [darwin, linux]
 ---
-## 步骤
-1. 先用 pdftotext -layout 保留版式
-2. 表格识别失败时用 -t 模式重试
 ```
 
-4. **查状态**。`openclaw skills list` 能看到每个技能是否满足依赖、为什么被排除；排查"模型为什么不用某个技能"，先看这里。个别技能也可以在配置里 allow/exclude 掉。
-5. **覆盖优先级**。workspace 技能（`~/.openclaw/workspace/skills/`）优先级高于内置技能，同名直接覆盖，方便针对自己的环境改写默认行为。
+3. 正文只写「agent 不知道而机器知道」的内容：pandoc 命令模板、输出路径约定、校验方式（用 `pdfinfo` 查页数），以及「什么时候不要用」。控制在 40 行以内。
+4. 用 `openclaw skills list` 检查状态：requires 不满足的 skill 会被标记为 unavailable 并从提示中剔除，避免带着坏依赖上线。
+5. 做两组对话实测：一句明确说「导出 PDF」应触发；一句只说「总结本周」不应触发。
 
 ## 踩坑点
 
-- **description 是唯一的路由依据**。写得太泛（"处理文件"）触发不了，只写名字更不行。建议"动词 + 场景"：什么时候用、处理什么对象。
-- **requires 漏配**。正文里用了 ffmpeg 却没声明 bins，模型会跑到报错才发现缺依赖，白费一整轮。
-- **正文里的环境差异**。从别人处搬来的技能常带硬编码路径或 macOS 专属命令，加载后反而把模型带偏，装完先通读一遍。
-- **别拿 Skills 当 MCP 用**。Skills 是给模型看的操作手册，不提供执行层；要真实调用外部服务还是靠 MCP/工具，Skill 只负责写清"怎么调用得漂亮"。
-- **技能互相冲突**。两个技能对同一工具给出矛盾指令时，模型行为会抖动，重叠职责的技能留一个就够。
+- **description 是唯一的路由信号。** 我第一版写「处理报告」，结果纯总结任务也触发了它。改成「仅在用户明确要求导出 PDF 报告时使用」后，边界立刻清晰。正例要写，反例更要写。
+- **requires.bins 必须声明。** 没写时机器缺 pandoc，agent 会凭训练知识幻觉出一套调用，排查半小时；声明后条件不满足直接不装载。
+- **正文别贪长。** 曾把整份报告模板贴进 SKILL.md，token 又膨胀回去了。解法：模板放同目录附属文件，正文只写「读取 ./template.md」。
+- **改动不热生效。** 修改 SKILL.md 后需重启 gateway 或开新会话，改了没反应先怀疑这个。
+- **多 agent 部署时 workspace skill 全员可见**，不希望共享的能力要在 agent 配置里做 allow/deny 收敛。
 
 ## 可复用建议
 
-- 颗粒度按"一个可交付结果"拆，不按脚本数量拆。
-- description 定期回顾：哪些任务模型没触发对应技能，多半是描述没对上用户实际的说法，改描述比改正文见效快。
-- 定期 `openclaw skills list` 审计，长期不触发的禁用，候选列表越短，路由越准。
-- 通用逻辑沉淀成模板技能，项目差异放进参数文件而不是复制多份。
+- 粒度对齐「一个明确意图」，不要做「大而全的工具箱 skill」。
+- 优先包装稳定的 CLI 而非自然语言流程：命令可校验、可用 requires 做环境闸门。
+- 每个 skill 正文末尾加「不要用于」一节，对触发边界的收益比想象大。
+- 公共素材一律走附属文件，SKILL.md 只当索引和入口。
 
 ## 总结
 
-Skills 机制本质上是上下文的懒加载：元信息常驻、正文按需、依赖不齐就不进场。把预算还给任务本身，模型的指令遵循率反而更高。想让 Agent 靠谱，先从写好每一行 description 开始。
+Skills 的价值不在于「装了多少能力」，而在于上下文里常驻的只有索引。把 description 当路由、requires 当闸门、正文当按需文档，三件事分开写清楚，助手的行为边界就会稳定很多。剩下的问题，交给实测对话去收敛。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-18/abdf79ccdd4b3788.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-18/a298f499883fdb2e.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-18/0164012b8bb451bd.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-18/a6e387068f9482f7.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-18/8c8ea86e98c8eea2.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-18/73dda2b048a42b93.png)
 
