@@ -1,72 +1,73 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 41961
+feedId: 42020
 source: 综合讨论
 publishedAt: 2026-10-19
 ---
 
 ## 背景
 
-跑 OpenClaw Agent 的人大多不止一台机器：开发用的 macOS 笔记本、家里的小主机、一台 VPS，可能还有 CI。Agent 对"这台机器长什么样"的认知来自两个来源：运行时探测，以及 tools.md 里的静态描述。tools.md 相当于 Agent 的《宿主机使用手册》——shell 是什么、包管理器用哪个、工作目录在哪、本地 MCP 服务跑在哪个端口、哪些事不许做。
+OpenClaw 的 agent 每次会话都在一个"陌生环境"里醒来：它知道怎么调工具，但不知道你的机器上有什么。macOS 还是 Linux、brew 还是 apt、Python 走 uv 还是系统自带、哪台机器要挂代理才能出网——这些模型一概不知。workspace 里的 `tools.md` 就是为这个存在的：一份每个会话注入上下文的**本机事实清单**。
 
-问题在于，很多人图省事，把所有环境信息写进一份 tools.md，或者散落在系统提示词和插件配置里。换台机器就出事：Agent 在 mac 上敲 `apt`，在无 GPU 的主机上尝试 CUDA，或者更糟——把内网地址和 API Key 随 tools.md 一起提交进了仓库。
+## 问题
 
-## 做法：分三层
+不维护这份清单的典型症状：
 
-核心思路是分层，把"处处为真的事实"和"本机特有的事实"分开：
+- agent 反复探测环境，`which python`、`brew list` 一路试错，白白烧掉几轮对话；
+- 拿通用假设硬套，比如在没装 Docker 的机器上直接甩 `docker compose up`；
+- 多台机器（笔记本、家用服务器、VPS）行为不一致，同一个 prompt 在 A 机能跑、B 机报错；
+- 你口头纠正过一次，下个会话它又忘了。
 
-1. **base 层**：跨平台通用的约定与边界。比如"长任务用后台任务加轮询""密钥只从环境变量读取，禁止写入任何文件"。进 Git，团队共享。
-2. **host 层**：只写本机差异。OS、包管理器、绝对路径、本地服务端口、硬件限制。一台机器一份，放 `~/.config/openclaw/tools.d/` 之类的位置，不进 Git。
-3. **secrets 纪律**：tools.md 里只写"从哪个环境变量读"，绝不写值本身。
+## 做法
 
-加载顺序：先 base，再 host，冲突时 host 覆盖。可以用简单的 include 机制，也可以在 Agent 启动前用一个几十行的脚本做合并。
-
-base 层示例（节选）：
-
-```markdown
-## Shell 约定
-- 优先写 POSIX 兼容命令
-- 长任务放后台，轮询而非死等
-
-## 秘密
-- API Key 只从 env `MODEL_API_KEY` 读取
-```
-
-host 层示例（家里的小主机）：
+1. **定位与粒度**：`tools.md` 放在 workspace 根目录，每台机器一份，不要跨机器同步——它描述的就是"这一台"。
+2. **写什么**：四段式结构，直接看骨架：
 
 ```markdown
-- OS: Debian 12，apt 可用，brew 不存在
-- 工作目录: /srv/agent-workspace
-- 本地服务: browser MCP 在 127.0.0.1:9222
-- 无 GPU，禁止尝试 CUDA 相关操作
+# tools.md（这台机器：MacBook Pro, macOS 15）
+## 环境
+- 包管理用 brew；apt 只存在于家里那台 Linux 服务器
+- Python 一律 `uv run python`，不要裸调 python
+## 常用命令
+- 跑测试：`cd ~/code/xxx && uv run pytest -q`
+- 本地服务状态：`systemctl status ollama`
+## 禁区
+- `~/backup` 只读；rsync 类命令先 `--dry-run`
+- pip 安装需走代理
+## 已知坑
+- 系统 python3.9 缺 ssl，别用
 ```
+
+3. **控制篇幅**：`tools.md` 每个会话都进上下文，要按 prompt 写，不是按文档写。我压在一页以内，能一行说清的不写三行。
+4. **动态事实写成查询指令，不写成值**：别写"GPU 现在空闲"，写"GPU 状态用 `nvidia-smi` 查"。
+5. **生成基线再手改**：先用脚本探测环境输出草稿（OS、包管理器、关键工具路径），人工删改后落盘，避免漏项，也避免把临时状态写进去。
+6. **验证**：改完直接问 agent："读一下 tools.md，复述你了解到的环境和约束"，确认理解到位；再跑一个真实任务，对照会话日志看它是否真的在用你写的命令。
 
 ## 踩坑点
 
-- **host 层误提交**。`.gitignore` 必须在第一次提交前配好，仓库里只放 base 层和模板。
-- **重复描述**。同一个工具在两层各写一遍，信息冲突时 Agent 会摇摆。约定：host 层只写差异，不复述 base 已有的内容。
-- **信息过期**。服务换了端口、目录挪了位置，tools.md 还是旧的。把它当"起点"而不是"事实源"——首次使用前让 Agent 探测验证一次。
-- **越写越长**。tools.md 直接吃上下文，控制在几十行。细节交给脚本的 `--help`，tools.md 只写"去哪找"。
-- **跨平台细节**。路径分隔符、行尾符、shell 语法差异，在 host 层显式标注，别指望 Agent 自己猜对。
+- **秘钥写进去**。`tools.md` 是明文，还可能被备份同步。只写"凭据在环境变量 `XXX` 里"，绝不写值。
+- **和 AGENTS.md 抢职责**。规则（"提交前先跑测试"）放 AGENTS.md，事实（"这台机器用 brew"）放 tools.md，两边重复必然漂移。
+- **信息过期**。agent 对这份清单信任度很高，卸载了工具没更新，它会对着报错反复重试。可以放進 heartbeat 定期自检，或环境大改后人工过一遍。
+- **写成散文**。大段描述模型抓不住重点，条目化、命令化最有效。
 
 ## 可复用建议
 
-- 维护一份 `tools.template.md`，新机器部署时复制出来填空，十分钟搞定。
-- 写个探测脚本（OS、包管理器、常见路径、监听端口），自动生成 host 层草稿，人工校对一遍。
-- 给 base 层加个 lint：检查高熵字符串，防止有人手滑把 Key 写进去。
-- 每次改 base 层，提交信息里写清改动原因，方便回溯"Agent 行为为什么变了"。
+- 四段式模板：环境 / 常用命令 / 禁区 / 已知坑，新机器十分钟填完；
+- 把 `tools.md` 纳入 dotfiles 仓库、按机器分分支，`diff` 一下就能看到环境差异；
+- 写个 20 行的 doctor 脚本，逐条检查清单里的命令是否仍存在、版本是否变化，输出漂移报告；
+- 团队场景：各自维护自己的 `tools.md`，仓库只共享项目级约定，机器级事实不上传。
 
 ## 总结
 
-tools.md 不是文档，是运行时配置的一部分。管好它的关键是分层与最小化：base 进仓库、host 留本机、secrets 只走环境变量，每层只写必要信息。做完这几件事，Agent 换机器的表现会稳定很多，审计和排障也都有了抓手。
+`tools.md` 的本质，是把环境的隐式知识变成注入上下文的显式契约。它不是文档工程，是 prompt 工程：短、准、可验证。多机用户尤其值得投入一次——省掉的是每次会话里 agent 的瞎猜，和你反复纠正的耐心。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/14603709f6ff4e6c.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/24b39a18c54d944a.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/f3b44c7c116d93b3.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/b35ce70c7f54c1bd.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/020c2f6b8bef0449.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/5ba0a10b067542ed.png)
 
