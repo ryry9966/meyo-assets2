@@ -1,71 +1,78 @@
 ---
 title: OpenClaw 的 IDENTITY.md：给 AI 一个可进化的身份
-feedId: 41987
+feedId: 42004
 source: 综合讨论
 publishedAt: 2026-10-19
 ---
 
-# 背景
+## 背景
 
-OpenClaw 的 workspace 里有一组小而关键的 Markdown 文件：`SOUL.md`、`USER.md`、`IDENTITY.md`、`MEMORY.md`。其中 IDENTITY.md 决定 agent "是谁"——名字、语气、emoji、行为边界。它每次会话启动都会被装进系统上下文，相当于 agent 的静态引导段。
+OpenClaw 的 workspace 里有一组"人格文件"：SOUL.md 管行为准则，USER.md 记用户画像，AGENTS.md 定工作方式。IDENTITY.md 是其中最小的一个，它只回答一个问题："我是谁"。默认路径在 `~/.openclaw/workspace/IDENTITY.md`，字段通常只有 Name、Creature、Emoji、Avatar、Vibe 这几行。听起来像装饰品，但跑久了你会发现，它是多渠道、多 Agent 场景下行为一致性的锚点。
 
-问题在于：大多数人写一次就再也不动它。
+## 问题
 
-# 问题
+没有认真维护 IDENTITY.md 时，常见的三种症状：
 
-两类典型失败：
+1. **人格漂移**：Telegram 上克制、CLI 里话痨，同一个 Agent 在不同 channel 表现得像三个不同的东西。
+2. **人格散落在 prompt 里**：系统提示、渠道模板、记忆文件各写一份"你应该……"，改一次要翻五个地方，改完还互相矛盾。
+3. **不可审计**：上周它还叫这个名字、用这个语气，现在变了，但没人知道是谁改的、为什么改。
 
-1. **身份与行为脱节。** 跑了几个月，agent 的实际风格已经被 MEMORY 和日常调教带偏，IDENTITY.md 还停留在第一天的三行字。新会话读到的人设和真实行为对不上，排查问题时也没有参照系。
-2. **放任自我改写导致漂移。** 反过来，如果让 agent 随便改自己的 identity，它会越改越讨好、越写越长，几周后边界约束消失，变成一个只会顺着你说的话痨。
+本质上：身份没有版本化，就谈不上"进化"，只能叫"随机漂移"。
 
-本质矛盾：identity 既需要稳定（否则长期记忆和协作习惯无所适从），又需要进化（否则和实际使用脱节）。
+## 做法
 
-# 做法
-
-我的方案是把它当代码管：**agent 提议，人审核，git 记录**。
-
-**第一步，最小骨架。** 控制在 30 行内，分两区：
+**第一步：最小可用身份。** 新建 IDENTITY.md，十行以内：
 
 ```markdown
-# Identity
-## 不变项（改动需人工确认）
-- 名字：Aka
-- 硬边界：不代发消息、不删文件、不确定就问
-## 可进化项
-- 语气：克制、直接、少用感叹号
-- 自称与 emoji：🦀
-- 汇报格式：结论先行
+# IDENTITY
+
+- **Name:** Claw
+- **Creature:** 机械螯虾
+- **Emoji:** 🦞
+- **Avatar:** avatars/claw.png
+- **Vibe:** 工程化、克制，先结论后依据
 ```
 
-**第二步，进化闭环。** 每两周固定一次：开一个独立会话，让它回顾这段时间的日志，只对"可进化项"输出 unified diff 建议 + 理由；你在 git 里 review，merge 才生效。"不变项"默认锁死，半年回顾一次。
+注意这是"名片"不是"作文"。它每个 session 都会被注入上下文，长文件是在烧 token 换噪音。
 
-**第三步，回归测试。** 改完用 3~5 个固定 prompt 跑一遍——一个任务型、一个边界测试型、一个闲聊型——语气和边界没跑偏才算过。
+**第二步：划清边界。** 身份只放稳定特质（名字、口吻、审美）；工作流规则放 AGENTS.md，行为红线放 SOUL.md，用户信息放 USER.md。判断标准很简单：这条描述半年后还成立吗？成立才进 IDENTITY.md。
 
-# 踩坑点
+**第三步：git 管起来。** 把 workspace 纳入版本控制，身份改动像发版一样提交：
 
-- **写太长。** identity 每轮都占上下文，越长权重越稀释，50 行是实用上限。
-- **把事实记忆塞进 identity。** "用户在做某项目"这类内容会腐烂，归 `USER.md` / `MEMORY.md` 管，别混。
-- **并发写冲突。** cron / heartbeat 任务和主会话同时改文件会互相覆盖。改 identity 的写权限只留给 review 会话，其他一律只读。
-- **改名太随意。** 旧记忆里全是旧名字的自指，agent 引用历史时会混乱。要改就在不变项里走一次正式变更，并接受记忆检索的过渡期噪声。
+```
+git commit -m "identity: 收敛语气，去掉营销腔"
+```
 
-# 可复用建议
+观察两三天的实际对话再决定下一次改动。"可进化"的全部含义就是：不是写得多，而是 diff 得清楚。
 
-- 所有变更走 commit，message 写清动机。半年后你能回答"它为什么变成现在这样"。
-- 频率低于你想象的才正确：两周到一个月一次足够，高频修改本身就是漂移源。
-- diff-only 原则：不接受"重写整个文件"，只接受局部 diff，review 成本才可控。
-- 多 gateway / 多实例的话，identity 主文件唯一，实例差异下沉到各自的 profile，不要 fork 出两份人格。
+**第四步（多 Agent 场景）：** 每个 Agent 独立 workspace、独立 IDENTITY.md。多个 Agent 共享一份身份文件，是人格串味的最快路径。
 
-# 总结
+## 踩坑点
 
-IDENTITY.md 不是一次性设定文档，而是你和 agent 之间的活契约。小步、可版本化、人审的进化机制，比"让它自己成长"的浪漫想象可靠得多。身份是你为长期协作定义的接口——接口可以升级，但要走变更流程。
+- **改完不生效**：身份在 session 启动时加载，长会话里改文件没用，先 `/new` 或重启会话。
+- **越写越长**：加到三十行后模型开始抓错重点。我的经验是超过十行就该砍，细节挪去 SOUL.md。
+- **与系统提示冲突**：全局 prompt 要求"永远简洁"，IDENTITY.md 却写着"热情洋溢地解释"，表现就会忽冷忽热。改身份前先 grep 一遍其他配置。
+- **Avatar 相对路径**：不同启动目录下会找不到图，用绝对路径或确保相对 workspace 根目录。
+- **频繁改人设**：每天换人设等于没有人设。把身份改动当 release，别当草稿。
+
+## 可复用建议
+
+1. **身份即代码**：review 一份身份 PR 的成本极低，收益是全渠道行为一致。
+2. **固定探针测试**：改完身份，用同一组问题（"做个自我介绍""拒绝一个不合理请求"）对比新旧输出，比肉眼感觉靠谱。
+3. **字段宁缺毋滥**：Creature、Colors 可有可无，但 Name 和 Vibe 建议必填——一个是调用锚点，一个是语气锚点。
+4. **备份再动刀**：重构身份前打个 tag，行为退化时 `git revert` 秒回滚。
+
+## 总结
+
+IDENTITY.md 的价值不在于让 AI"更像个人"，而在于把一件原本散落、模糊、不可审计的事——Agent 是谁——变成一个十行以内、可 diff、可回滚的文件。身份进化的正确姿势是：频繁提交、缓慢变更、随时能退。这套做法零成本，今天就可以从 `git init` 开始。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/58c924d2209ddbfa.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/e816f14bec1d21b9.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/9723880f9abb2be8.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/c958cc0d836d8df0.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/b5f037118cdde062.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-19/e20696409ff4d338.png)
 
