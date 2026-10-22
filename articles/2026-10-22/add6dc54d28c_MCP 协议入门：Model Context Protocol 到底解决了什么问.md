@@ -1,61 +1,59 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 42235
+feedId: 42250
 source: 综合讨论
 publishedAt: 2026-10-22
 ---
 
 ## 背景
 
-过去一两年，把工具接进 LLM 这件事基本是各自为战：Function Calling 的 schema 各家略有差异，每个 Agent 框架都发明了一套自己的插件格式。你写了一个"查数据库"的工具，在框架 A 里要包一层胶水，换到框架 B 又得重写。工具本身没变，变的是接入层。
+Agent 能力上限越来越取决于它能"够到"什么。早些时候给 Agent 接工具基本是点对点硬写：接 GitHub 要写一份 connector，接数据库再写一份，换个 Agent 框架，同样的活再干一遍。工具数量 × Agent 框架数量，集成就成了 N×M 的重复劳动，而且各家接口格式互不兼容。
 
-2024 年底 Anthropic 开源了 Model Context Protocol（MCP），试图把这层胶水标准化。它本质上是一个开放协议，定义了 LLM 应用与外部工具、数据源之间的通信规范。
+## MCP 解决了什么
 
-## 它到底解决了什么问题
+Model Context Protocol 的核心思路很简单：把"Agent 怎么调外部能力"标准化成一个开放协议。它统一的不只是工具调用，还包括上下文的注入方式。
 
-核心是 M×N 问题：M 个 Agent 应用 × N 个工具，过去需要 M×N 次适配。有了 MCP，工具方只需实现一次 MCP Server，任何支持 MCP 的客户端都能直接使用，问题变成 M+N。
+协议里三个角色：Host（Agent 应用本体）、Client（Host 内维护连接的组件）、Server（暴露能力的轻量服务）。对开发者来说最关心的是 Server 暴露的三类原语：
 
-具体拆开，MCP 统一了三件事：
+- **Tools**：可执行的操作，模型主动调用（查数据库、发消息、跑脚本）
+- **Resources**：可读取的数据，类似只读文件（配置、文档、日志）
+- **Prompts**：预置的提示模板，用户侧触发
 
-1. **工具发现**：客户端通过 `tools/list` 拿到工具清单和参数 schema，不用硬编码；
-2. **调用约定**：统一的 `tools/call` 请求/响应格式，错误语义清晰（业务失败用 `isError` 标记，区别于传输层异常）；
-3. **传输方式**：stdio（本地子进程）和 Streamable HTTP（远程服务）两种标准传输，HTTP 模式下走 OAuth 鉴权。
+一个 MCP Server 写一次，任何兼容协议的 Host 都能用——这就是把 N×M 降成 N+M 的方式，可以类比为 AI 应用的 USB-C。
 
-对实践者来说最大的收益是复用：社区现成的 MCP Server（文件系统、Git、数据库、浏览器）可以直接挂载，省掉自己写胶水的时间。
+## 上手路径
 
-## 在 OpenClaw 里怎么接
-
-1. 确认所用版本的 MCP 支持已开启（配置中对应 `mcpServers` 段）；
-2. 本地工具走 stdio：指定 server 的启动 command 和 args，例如官方 filesystem server；
-3. 远程工具走 URL：接入 Streamable HTTP server；
-4. 重启后确认工具列表已加载，在对话里触发一次调用做验证；
-5. 控制挂载数量，只挂当前场景真正需要的 server。
+1. **先跑现成的**。社区有 filesystem、fetch、git 等常用 Server，在 Host 配置里加一段 JSON（command + args + env），重启就能看到工具被加载。
+2. **理解传输层**。本地跑用 stdio（进程直连），远程用 Streamable HTTP。日常实验 stdio 最省事。
+3. **写一个自己的 Server**。用官方 SDK（Python/TypeScript）二三十行就能包一个内部 API：声明 tool 的 name、description、JSON Schema 入参，注册 handler 即可。
+4. **验证调用链**。让 Agent 实际调一次，观察参数是否按 Schema 生成，这是排查问题的第一步。
 
 ## 踩坑点
 
-- **工具不是越多越好**。每个工具的 schema 都占上下文，挂几十个 server、上百个工具后，模型选错工具的概率明显上升。按项目裁剪。
-- **description 要当 prompt 写**。自研 MCP Server 时，工具描述含糊，模型就会乱传参数。这是新手最常见的翻车点。
-- **stdio 的进程管理**。客户端退出时子进程不一定干净回收，长会话注意僵尸进程和句柄泄漏。
-- **安全边界**。挂第三方 MCP Server 等于授予执行权限，尤其 filesystem、shell 类。先确认来源和最小权限，别全量挂载。
-- **isError 与异常要分清**。工具执行失败应返回 `isError: true` 让模型自行重试或换路，直接抛异常会中断整轮调用。
+- **description 就是给模型看的接口文档**。写得太含糊，模型要么不调、要么传错参。把"什么时候用 / 什么时候不用 / 返回什么"写清楚，准确率提升立竿见影。
+- **工具不是越多越好**。一次挂 30+ 个工具，上下文变胖，选错工具的概率明显上升。按场景分组配置，用到哪组挂哪组。
+- **权限要收敛**。MCP Server 跑在你本机权限下，filesystem Server 把整个家目录暴露出去等于裸奔。用 roots 限定目录，只开必要的 allowlist。
+- **工具结果也可能有注入**。Server 返回内容会进模型上下文，别默认它可信，敏感操作前保留人工确认。
+- **Windows 下 stdio 编码**。中文环境常见 GBK/UTF-8 冲突导致 Server 起不来，显式设置 `PYTHONUTF8=1` 或改走 HTTP 传输可绕开。
 
 ## 可复用建议
 
-- 把常用 server 组合按场景做成配置片段，比如"写代码套件"（filesystem + git + 搜索），新项目直接复用；
-- 团队自研内部系统时，优先暴露 MCP 而非只提供 REST API，一次投入，所有 Agent 受益；
-- 给每个 MCP Server 维护一份最小权限清单：默认只读，写操作显式开启。
+- 优先复用社区 Server，只有包内部 API 时才自己写
+- 一个 tool 对应一个清晰动作，别做万能大接口
+- MCP 配置纳入版本库，不同项目挂不同 Server 集合
+- 给 Agent 开工具调用日志，出问题能分清是 Server 的锅还是模型选型的锅
 
 ## 总结
 
-MCP 没有让工具变强，它做的是把"接入"这件事的成本打下来。对个人用户，意味着现成生态即插即用；对团队，意味着工具层和 Agent 层可以解耦演进。如果你的自动化流程里还留着手写的胶水代码，值得花一个下午迁到 MCP 上——不是因为它新，而是因为之后不用再写第二遍。
+MCP 没有魔法，它做的是把一个存在多年的集成问题标准化：工具提供方只写一次 Server，Agent 使用方只实现一次 Client。对 OpenClaw 用户来说，理解 Tools / Resources / Prompts 三类原语和权限边界，基本就能把 MCP 用在正确的位置。它解决的是"接入层"问题，别指望它替你设计工具粒度和安全模型——那部分仍然是工程师的活。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/aa84235f1f4d2c99.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/29646bece7538921.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/0e1d1eddb21f7bec.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/20932ea68623ab0b.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/bfe8fcf93f024d9f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/8796bfae5efe5b74.png)
 
