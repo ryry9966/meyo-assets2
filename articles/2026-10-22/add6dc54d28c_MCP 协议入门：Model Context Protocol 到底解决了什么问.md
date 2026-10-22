@@ -1,59 +1,72 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 42250
+feedId: 42282
 source: 综合讨论
 publishedAt: 2026-10-22
 ---
 
-## 背景
+## 背景：工具接入的碎片化
 
-Agent 能力上限越来越取决于它能"够到"什么。早些时候给 Agent 接工具基本是点对点硬写：接 GitHub 要写一份 connector，接数据库再写一份，换个 Agent 框架，同样的活再干一遍。工具数量 × Agent 框架数量，集成就成了 N×M 的重复劳动，而且各家接口格式互不兼容。
+做过 Agent 的人都遇到过同一个瓶颈：模型能力的上限，很大程度取决于它能调到什么工具。但在 MCP 出现之前，工具接入是碎片化的——在 OpenClaw 里接文件系统、接浏览器、接数据库，每种都要单独写适配；各家模型的 function calling schema 又不完全兼容，同一个工具定义换个运行时基本要重写。
 
-## MCP 解决了什么
+## 问题：M×N 的适配矩阵
 
-Model Context Protocol 的核心思路很简单：把"Agent 怎么调外部能力"标准化成一个开放协议。它统一的不只是工具调用，还包括上下文的注入方式。
+抽象一下：M 个客户端（各种 Agent 宿主、你自己的脚本）想接 N 个工具，没有统一协议时，最坏要写 M×N 份胶水代码，每个客户端为每个工具单独处理发现、调用、鉴权和进程管理。后果很实际：
 
-协议里三个角色：Host（Agent 应用本体）、Client（Host 内维护连接的组件）、Server（暴露能力的轻量服务）。对开发者来说最关心的是 Server 暴露的三类原语：
+- 重复造轮子，每个运行时养一套自己的插件体系；
+- 工具质量参差，有的返回结构化数据，有的把命令行输出原样塞给模型；
+- 不可移植，给 A 写的工具到 B 得从头再来。
 
-- **Tools**：可执行的操作，模型主动调用（查数据库、发消息、跑脚本）
-- **Resources**：可读取的数据，类似只读文件（配置、文档、日志）
-- **Prompts**：预置的提示模板，用户侧触发
+## MCP 做了什么：把乘法压成加法
 
-一个 MCP Server 写一次，任何兼容协议的 Host 都能用——这就是把 N×M 降成 N+M 的方式，可以类比为 AI 应用的 USB-C。
+MCP 的核心是统一这层接口：工具方实现一次 server，调用方实现一次 host，两边通过 JSON-RPC 通信。官方宣传里常比作 USB-C，对工程实践来说，真正省掉的是那部分乘法。
 
-## 上手路径
+值得关注的三个原语：
 
-1. **先跑现成的**。社区有 filesystem、fetch、git 等常用 Server，在 Host 配置里加一段 JSON（command + args + env），重启就能看到工具被加载。
-2. **理解传输层**。本地跑用 stdio（进程直连），远程用 Streamable HTTP。日常实验 stdio 最省事。
-3. **写一个自己的 Server**。用官方 SDK（Python/TypeScript）二三十行就能包一个内部 API：声明 tool 的 name、description、JSON Schema 入参，注册 handler 即可。
-4. **验证调用链**。让 Agent 实际调一次，观察参数是否按 Schema 生成，这是排查问题的第一步。
+- **tools**：可被模型调用的函数，带参数 schema；
+- **resources**：可读取的上下文数据（文件、记录）；
+- **prompts**：预置的提示词模板。
+
+传输层常见两种：本地进程走 stdio，远程服务走 streamable HTTP，连接建立时会做能力协商。一个清醒的认知：MCP 不负责让你的工具变好用，它只统一握手方式。
+
+## 实践步骤
+
+在 OpenClaw 里挂一个 MCP server，大致流程：
+
+1. 先跑通目标 server，确认它能以 stdio 本地启动或提供 HTTP 端点；
+2. 在配置中声明该 server，注明 transport 类型与启动命令；
+3. 重新加载后列出工具清单，核对工具名与参数 schema；
+4. 手动触发一次调用，检查返回是否结构化、能否直接进上下文；
+5. 观察上下文占用，评估工具描述的 token 开销；
+6. 按需裁剪，只暴露当前任务真正需要的工具。
 
 ## 踩坑点
 
-- **description 就是给模型看的接口文档**。写得太含糊，模型要么不调、要么传错参。把"什么时候用 / 什么时候不用 / 返回什么"写清楚，准确率提升立竿见影。
-- **工具不是越多越好**。一次挂 30+ 个工具，上下文变胖，选错工具的概率明显上升。按场景分组配置，用到哪组挂哪组。
-- **权限要收敛**。MCP Server 跑在你本机权限下，filesystem Server 把整个家目录暴露出去等于裸奔。用 roots 限定目录，只开必要的 allowlist。
-- **工具结果也可能有注入**。Server 返回内容会进模型上下文，别默认它可信，敏感操作前保留人工确认。
-- **Windows 下 stdio 编码**。中文环境常见 GBK/UTF-8 冲突导致 Server 起不来，显式设置 `PYTHONUTF8=1` 或改走 HTTP 传输可绕开。
+- **工具描述含糊是第一大坑。** 模型完全靠 description 决定调不调、怎么调，措辞模糊的结果是乱调或拒调。
+- **上下文膨胀。** 十几个工具的 schema 叠起来轻松吃掉几千 token，小窗口模型上全量暴露会明显拉低任务质量。
+- **stdio 进程管理。** server 崩了可能留僵尸进程；它的日志如果打进 stdout 会污染 JSON-RPC 流，务必走 stderr。
+- **鉴权别裸奔。** HTTP transport 的 token 不要明文进仓库，本地 stdio 也要收窄工具能摸到的文件范围。
+- **返回值过大。** 一次查询返回上万 token 会直接污染上下文，截断和分页应做在 server 侧。
 
 ## 可复用建议
 
-- 优先复用社区 Server，只有包内部 API 时才自己写
-- 一个 tool 对应一个清晰动作，别做万能大接口
-- MCP 配置纳入版本库，不同项目挂不同 Server 集合
-- 给 Agent 开工具调用日志，出问题能分清是 Server 的锅还是模型选型的锅
+- 验证链路先用官方 reference server（filesystem、fetch 这类），跑通再写自己的；
+- 给工具名加前缀，避免同时挂多个 server 时命名冲突；
+- 工具分层：高频的留默认集，其余按会话启用；
+- 记录每次 tool call 的输入、输出和耗时，这是后续优化的唯一依据；
+- 自建 server 至少在两个不同宿主上测一遍，可移植性才算验证过。
 
 ## 总结
 
-MCP 没有魔法，它做的是把一个存在多年的集成问题标准化：工具提供方只写一次 Server，Agent 使用方只实现一次 Client。对 OpenClaw 用户来说，理解 Tools / Resources / Prompts 三类原语和权限边界，基本就能把 MCP 用在正确的位置。它解决的是"接入层"问题，别指望它替你设计工具粒度和安全模型——那部分仍然是工程师的活。
+MCP 解决的是接口层碎片化，不是工具质量问题。它把「每个客户端为每个工具写适配」的乘法压成加法：工具方写一次 server，生态里所有 host 都能用。对 OpenClaw 用户来说，实际收益是标准 server 可以直接拿来用，自建工具有了一个可移植的目标形态。至于 schema 怎么设计、返回值怎么收敛、权限怎么收口，依然取决于实现质量——协议只标准化了握手，握手之后做得好不好，还是工程功夫。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/29646bece7538921.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/277e7d055b4c877e.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/20932ea68623ab0b.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/d3d85c917d64eb03.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/8796bfae5efe5b74.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-22/35c8b36317d8d4b1.png)
 
