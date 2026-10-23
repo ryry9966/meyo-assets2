@@ -1,68 +1,90 @@
 ---
 title: LLM 输出解析的防御性编程：JSON 标签格式混合处理实战
-feedId: 42328
+feedId: 42386
 source: 综合讨论
 publishedAt: 2026-10-23
 ---
 
 ## 背景
 
-只要你的 OpenClaw skill 或 MCP 工具链里有一环是"让模型返回 JSON"，就会遇到同一个事实：同一个 prompt，换个模型、换个温度，返回的包装格式就不一样。我们在一条自动化流水线里先后接了通用对话模型和推理模型，解析层第一周崩了三次，最后把解析重写成一条防御性流水线才稳定下来。
+在 OpenClaw 的插件和自动化流程里，让模型按约定输出 JSON 是高频场景：工具参数回填、MCP 结果整理、定时任务的摘要落库，都依赖一段"看起来能直接 `json.loads`"的文本。我们通常在 prompt 里写"请用 ```` ```json ```` 代码块输出"或"用 `<json>` 标签包裹"，但实测下来，同一个模型在不同温度、不同上下文长度、甚至不同会话里，给出的格式并不稳定。
 
-## 问题：四种"合法"的脏输出
+## 问题
 
-同样是"请输出 JSON"，实际拿到手的至少有四种形态：
+我把近两周插件日志里的解析失败样本拉出来粗看，分布大致是：
 
-1. 围栏包裹：```json … ```，偶尔是 ```、```JSON、甚至 ```jsonc；
-2. 裸 JSON 前后带话："好的，以下是结果：{…} 如有疑问请告诉我"；
-3. 推理模型先吐一段 `<think>…</think>`，再接围栏或裸 JSON；
-4. 半残 JSON：尾部多逗号、中文引号，或被 max_tokens 截断。
+- 约四成是**裸 JSON**，没有任何包裹；
+- 约三成是 ```` ```json ```` 围栏，但前面带一句"好的，以下是结果"；
+- 其余是 `<json>` / `<JSON>` / `<output>` 标签混用、大小写不定、带属性变体；
+- JSON 内部混着**全角引号、尾逗号、`//` 注释**；
+- 少数样本输出两段 JSON，或代码围栏里再嵌围栏。
 
-任何一层直接 `json.loads`，本质都是把概率性输出当确定性输入用。
+裸 parse 的结果就是：测试环境跑得通，上线后间歇性炸，而且炸的位置每次不一样。
 
-## 做法：解析流水线，五步走
+## 做法
+
+思路是**分层降级**，每层只做一件事，失败就交给下一层：
+
+1. **提取层**：正则剥出候选文本，围栏、标签、裸文本都算候选，按优先级排队；
+2. **归一化层**：全角引号转半角、去尾逗号、去行注释、清零宽字符与 BOM；
+3. **解析层**：逐候选 `json.loads`，全失败再用 `ast.literal_eval` 兜底（能接住单引号字典）；
+4. **验证层**：pydantic 校验字段与类型，不通过就把**具体报错**拼回 prompt 重试一次；
+5. **留痕**：无论成败，原始文本都落日志。
+
+核心逻辑压缩后二十行左右：
 
 ```python
-def extract_json(text: str) -> str:
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)  # 1. 预处理
-    text = text.strip().lstrip("\ufeff")
-    m = re.search(r"```(?:json|jsonc)?\s*(.*?)\s*```", text, re.S | re.I)
-    if m:
-        text = m.group(1)                                       # 2. 剥围栏
-    return scan_json_block(text)  # 3. 字符串感知的括号配对，取最外层块
+import json, re, ast
+
+CAND = [
+    re.compile(r"```(?:json)?\s*(.+?)```", re.S | re.I),    # 非贪婪
+    re.compile(r"```(?:json)?\s*(.+)\s*```", re.S | re.I),  # 贪婪，防嵌套
+    re.compile(r"<(?:json|output|result)\b[^>]*>(.+?)</", re.S | re.I),
+]
+
+def parse_llm_json(text: str):
+    candidates = [m.group(1) for p in CAND for m in p.finditer(text)]
+    candidates.append(text)  # 裸 JSON 兜底
+    for c in candidates:
+        s = c.strip().strip("`").strip()
+        s = (s.replace("\u201c", '"').replace("\u201d", '"')
+              .replace("\u2018", "'").replace("\u2019", "'"))
+        s = re.sub(r"^\s*(//|#).*?$", "", s, flags=re.M)
+        s = re.sub(r",\s*([}\]])", r"\1", s)  # 尾逗号
+        for fn in (json.loads, ast.literal_eval):
+            try:
+                return fn(s)
+            except Exception:
+                continue
+    return None
 ```
-
-之后两步：
-
-4. **修复**：trailing comma、中文引号可以安全替换；但截断的 JSON 不要硬补，先看响应里的 finish_reason，截断就走重试或报错；
-5. **校验**：过一遍 pydantic / zod 的 schema，字段缺失、类型不对直接判失败；失败时把原始输出带回 prompt 重试一次，仍失败进死信队列。
 
 ## 踩坑点
 
-- 贪婪正则 `r"\{.*\}"` 遇到嵌套对象会从第一个 `{` 一路匹配到最后一个 `}`，中间夹着 prose 也照单全收；
-- 括号扫描如果不处理字符串态，JSON 字符串值里的 `"{"` 会把深度计数搞崩；
-- 流式场景把 chunk 直接拼接，可能得到两个粘连的 JSON 对象，loads 报"额外数据"；
-- 修复类库对截断输出会"脑补"出一个合法 JSON，静默产出脏数据——比抛异常危险得多；
-- 日志全量打印原始输出，既刷屏又有敏感信息风险，建议截断到几百字符。
+- 正则务必 `re.I`，标签匹配要允许属性：`<json lang="zh">` 这种变体真实存在。
+- 贪婪与非贪婪各有坑：内容嵌围栏时，非贪婪截断、贪婪吞后文。两种候选都生成，交给解析层裁决。
+- 多 JSON 块取"第一个解析成功的"，别取最后一个——补充说明里常跟着一段示例。
+- 归一化别贪：跑两轮还修不好就直接走重试，硬修出来的脏数据比解析失败更难排查。
+- 重试必须带具体报错（哪个字符、哪一行），否则模型会原样再犯一遍。
 
 ## 可复用建议
 
-- 解析逻辑收敛到一个模块，所有 skill 复用，别在各自 handler 里散落 strip 和正则；
-- 模型侧优先用 structured output / tool call，但外层兜底流水线照留——供应商降级、上下文污染时它救过我们；
-- 每次解析失败把原始样本落盘，一个月后就是现成的回归测试集；
-- prompt 和 parser 当作一个版本单元管理，改输出格式约定时两边同步。
+- 把解析器做成独立中间件，统一返回 `{ok, data, raw, error}`，业务代码永远不直接碰原始文本。
+- 真实失败样本沉淀成测试集，换模型、改 prompt 后跑一遍回归，比临时写单测值钱得多。
+- 能用结构化输出 / JSON mode 就优先用，防御解析是兜底，不是第一选择。
+- 温度压低，few-shot 里给一组"错误示例 + 正确示例"，能把格式漂移压下去一大半。
 
 ## 总结
 
-LLM 输出解析的本质，是在概率系统和确定性系统之间加一层收敛。格式混排不是异常，是常态。把"剥标签 → 定位 → 修复 → 校验 → 重试"做成固定流水线，Agent 链路才能从"偶尔能跑"变成"长期能跑"。
+和 LLM 打交道的解析代码，本质不是"解析"，而是**分层降级 + 全程留痕**。默认模型会犯错，把每一次犯错变成可复现的用例，系统才能从间歇性崩溃变成可预期运行。上面这段代码可以直接抄进插件里，欢迎在回帖里贴你踩到的坏样本，攒成社区的公共测试集。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-23/2b49b7080a1d271d.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-23/64065fd7cc20c9e5.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-23/a2c12f585bfe0aa8.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-23/1e5a752f00b12b66.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-23/668bdb0d1f16b81f.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-23/38915bcc0a839b2b.png)
 
