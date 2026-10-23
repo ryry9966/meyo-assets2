@@ -1,77 +1,70 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 42410
+feedId: 42412
 source: 综合讨论
 publishedAt: 2026-10-24
 ---
 
 ## 背景
 
-用 Agent（OpenClaw、各类 CLI Agent、MCP 客户端）跑本地自动化一段时间后，你会发现它能不能干活，往往不取决于模型多聪明，而取决于它对这台机器了解多少。工具路径、版本、代理、端口占用、GPU 有无——这些环境事实平时散落在 shell rc、.env、README 和聊天记录里，Agent 每次都在重新猜。
-
-tools.md 的思路很简单：在固定位置放一份 Markdown，把 Agent 需要的环境事实显式写下来，让它随上下文加载。在 OpenClaw 里，workspace 自带的 TOOLS.md 就是干这个的，由 Agent 自己读、自己维护。
+OpenClaw 这类本地 Agent 的基本盘，是把 workspace 里的 markdown 当上下文读进去：AGENTS.md 约束行为，记忆文件延续会话。但有一类信息经常没地方放——**本地环境事实**。同一份 workspace 往往要在多台机器上跑：开发用的 Mac、家里的 Linux 小主机、一台 VPS。工具链、包管理器、路径、端口，全都对不上。
 
 ## 问题
 
-三个典型场景：
+Agent 默认靠现场探测认识环境：`which`、`--version`、试装包、猜路径。结果有两个：
 
-- 同一套配置，MacBook 和 Linux 服务器表现不一致：前者 ffmpeg 在 `/opt/homebrew/bin`，后者在 `/usr/bin`，Agent 猜错就报错。
-- 团队仓库里写死“用 pnpm”，对你是共识，对新同事的机器不是，Agent 按文档执行直接失败。
-- 上周告诉过 Agent“这台机出网要走本地代理”，它记在会话里，这周开新会话全忘了。
+1. **重复消耗**。每次新会话都从头探测一遍，token 和轮次都在烧。
+2. **猜错成本高**。在 apt 机器上按 brew 的思路装依赖，把 macOS 的路径当 Linux 用，折腾半天才发现方向反了。
 
-根因是环境知识没有显式化、没有分层，全靠会话记忆和口头约定。
+更麻烦的是，这些试错经验散落在各会话的记忆里，不可 review、不可同步。换台机器，一切从零开始。
 
-## 做法与步骤
+## 做法
 
-**1. 分两层，职责分开**
+核心思路一句话：**把环境事实从会话里搬出来，落成一个文件。**
 
-- 全局层：workspace 的 `TOOLS.md`（如 `~/.openclaw/workspace/TOOLS.md`），只写“这台机器”的事实：工具链及路径、代理、GPU/CUDA、已知坑。不进项目仓库。
-- 项目层：仓库根目录的 AGENTS.md 或同等文件，进版本控制，只写“这个项目”的约定：包管理器、启动命令、禁止触碰的目录。
-
-**2. 写可验证的事实，不写散文**，每条尽量带验证方式：
+1. 在 workspace 根目录建 `tools.md`，按机器分节，字段统一：
 
 ```markdown
-## 工具链
-- node: v22（nvm 管理），验证 `node -v`
-- ffmpeg: /opt/homebrew/bin/ffmpeg（brew）
+# tools.md
 
-## 已知坑
-- 8080 被常驻服务占用，dev server 用 8081
-- 出网需代理 http://127.0.0.1:7890
+## laptop-mac (darwin / arm64 / 2025-06 验证)
+- python: /opt/homebrew/bin/python3.12，无裸 python
+- 包管理: brew；node 走 nvm
+- 已知坑: docker 依赖 colima，需先启动
 
-## 禁止
-- 不要改 /etc/hosts
+## home-server (debian / x86_64 / 2025-06 首次探测)
+- python: /usr/bin/python3.11
+- 包管理: apt；禁用 sudo pip
 ```
 
-**3. 控制篇幅**。tools.md 会进上下文，一屏以内最好，只放 Agent 真会用到的。
-
-**4. 建立更新闭环**。Agent 执行中发现新事实（命令不存在、端口冲突、权限问题），当场补进 tools.md。可以在 AGENTS.md 里明文要求它这么做，把 tools.md 当环境记忆，而不是一次性文档。
+2. 在 AGENTS.md 里加一条硬规则：动手前先读 tools.md；找不到当前机器的条目才允许探测，探测结论写回文件。
+3. 首次落地可以让 Agent 跑一轮探测生成草稿，人工删改后提交 git。之后多机同步靠 pull，而不是靠各机器的记忆各自长歪。
+4. 每条环境事实带验证日期——过期的条目比缺失更危险。
 
 ## 踩坑点
 
-- **写成小作文**：段落式的背景介绍对 Agent 没有增量，白耗上下文。
-- **写入密钥**：tools.md 会被读进模型上下文，任何 key/token 只能写变量名引用，绝不写值。
-- **记录运行时可探测的东西**：`which ffmpeg` 一秒能查到的事，写死反而会过期。原则：能探测的不写，写下来的必须准。
-- **版本号写死到补丁位**：写"node v22 + 验证命令"，比写"v22.11.0"存活期长得多。
-- **假设框架会自动读**：不同 Agent harness 对这类文件的发现机制不同，先确认你的环境真的加载了它，别自我感动。
+- **别写密钥值**。tools.md 会被注入上下文，等于把 secret 摊在模型面前。只写“密钥在哪个路径、怎么取”，不写内容本身。
+- **别把流程塞进来**。AGENTS.md 管行为规范，tools.md 只放环境事实。两者混写，文件很快变成没人维护的大杂烩。
+- **机器标识要稳定**。用 hostname 或固定机器名做 key。标识一变，条目错配，Agent 拿着 A 机器的说明书操作 B 机器。
+- **控制篇幅**。一屏以内、条目化。写成百科全书，Agent 实际只会用到前几行。
 
 ## 可复用建议
 
-- 新机器初始化时，把写 tools.md 当作装机清单的一部分：装完环境顺手核一遍，相当于给自己的 runbook。
-- 项目层文件可以反哺 onboarding：新人读它就知道环境约定，一份文档两用。
-- 团队已有 setup 脚本的话，让 tools.md 与脚本互相引用，保持单一事实源，避免两处漂移。
+- **闭环习惯**：每次 Agent 修好一个环境问题，让它顺手按固定格式写回 tools.md。走 commit 的话，改动在 diff 里一眼可见。
+- **字段即契约**：工具名、路径、版本、坑，四项固定，diff 才有意义，也方便写脚本校验。
+- **团队场景当基础设施代码对待**：改 tools.md 走 PR，不走口头。它是文档，更是配置。
 
 ## 总结
 
-tools.md 不是新协议，就是几 KB 的 Markdown 约定。它的价值在于把“Agent 与这台机器的契约”从隐式变成显式、从会话记忆变成落盘状态。分层写、写事实、能探测的不写、发现即更新——做到这四条，Agent 在不同环境下行为的一致性会有肉眼可见的提升。
+tools.md 做的事情很小：给 Agent 一份可版本化、可 review 的环境说明书。成本是十几行 markdown，收益是首次命中率明显上升、跨机器行为一致、经验沉淀从“玄学”变成“资产”。与其反复调 prompt，不如先把事实写清楚——这通常是更划算的那一步。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-24/b9bc2483b8e6186e.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-24/238950fc18b873c5.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-24/36af8e441e7e8e42.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-24/e29a039eafca313e.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-24/981532acf18e2d09.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-24/6f42d94d533ef23a.png)
 
