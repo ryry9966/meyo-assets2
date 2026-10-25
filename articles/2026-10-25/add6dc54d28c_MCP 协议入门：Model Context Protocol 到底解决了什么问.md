@@ -1,66 +1,76 @@
 ---
 title: MCP 协议入门：Model Context Protocol 到底解决了什么问题
-feedId: 42541
+feedId: 42559
 source: 综合讨论
 publishedAt: 2026-10-25
 ---
 
 ## 背景
 
-Function calling 普及之后，给模型挂工具这件事变成了体力活：OpenClaw 要接文件系统，接浏览器，接内部 API，每接一个都要写一层胶水代码——发现工具、传参、鉴权、错误处理，每个宿主框架的插件格式还不一样。工具方要为每个 agent 平台维护一份适配，宿主要逐个接入。2024 年底 Anthropic 提出 MCP（Model Context Protocol），一年多下来已经成了这个领域事实上的通用协议，OpenClaw 也原生支持。
+做 Agent 自动化的人对"接工具"的碎活都不陌生：每个框架有自己的插件格式，接一个内部 API 要写 schema、写描述、写鉴权胶水代码，换个宿主全部重来一遍。
 
-## 它到底解决了什么问题
+这就是经典的 M×N 问题：M 个宿主 × N 个工具，最坏要写 M×N 份适配代码。MCP（Model Context Protocol）的思路是把乘法变加法：工具方实现一次 MCP Server，任何支持 MCP 的宿主都能直接用。
 
-一句话：把 M×N 变成 M+N。M 个 agent 框架、N 个工具，以前是两两写集成；有了协议，工具方实现一次 MCP server，任何支持协议的 client 都能直接用。
+常有人说 MCP 是"AI 的 USB-C"，这个类比有点营销味，但方向对：它不规定工具能干什么，只规定双方怎么对话。
 
-更深一层看，function calling 只回答"模型能不能调工具"，MCP 管的是调之前的一整套工程：工具发现（tools/list）、传输方式（本地 stdio / 远程 Streamable HTTP）、进程生命周期、鉴权（OAuth）、上下文资源（resources / prompts）。它把"接入工具"从一个代码问题降级成一个配置问题。
+## 问题
 
-## 在 OpenClaw 里跑通最小示例
+MCP 具体标准化了三件事：
 
-1. **选 transport**：本地工具用 stdio（框架拉起子进程），远程服务用 HTTP。
-2. **注册 server**（示意，字段以当前版本文档为准）：
+1. **发现机制**：宿主连上 Server 后自动列出可用的 tools、resources、prompts，无需手工登记；
+2. **调用契约**：统一的 JSON-RPC 消息与 JSON Schema，宿主负责转成模型侧的 function calling 格式；
+3. **传输层**：本地 stdio、远程 Streamable HTTP，含协议版本协商。
 
-```json
-{
-  "mcpServers": {
-    "fs": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/projects"]
-    }
-  }
-}
+没解决的也要说清：不保证描述质量（模型选不选得对全看 description）、不统一鉴权（远程 Server 各家实现差异大）、更不解决工具本身设计烂的问题。
+
+## 做法与步骤
+
+用 Python 官方 SDK 走一条最小路径：
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("ops-tools")
+
+@mcp.tool()
+def query_order(order_id: str) -> str:
+    """按订单号查询订单状态，返回 JSON 字符串；找不到返回空对象。"""
+    return get_order(order_id)
+
+mcp.run()  # 默认 stdio 传输
 ```
 
-3. **重启并确认工具被发现**：看日志里的工具列表，而不是想当然。
-4. **权限收口**：只挂需要的目录，新 server 先只读。
-5. **用一个具体任务验证**：比如"列出该目录下最近修改的三个文件"，能正确选工具、传对参数，才算通。
+1. 在 OpenClaw 或其他宿主的配置里注册这个 Server（本地就是一条启动命令加参数）；
+2. 连接后先调 `tools/list`，核对工具名、参数 schema、描述——这一步比急着跑通更重要；
+3. 用真实输入调 `tools/call`，确认返回结构和错误路径（超时、异常时返回什么）；
+4. 都没问题再接入 Agent 主流程。
 
 ## 踩坑点
 
-- **stdout 污染**：stdio 模式下 stdout 就是 JSON-RPC 通道，server 里随手 `print` 一行日志，协议直接断。日志一律写 stderr。
-- **description 是 prompt，不是注释**：写得含糊，模型就乱调、漏参。把单位、约束、副作用写进去，标准是"新人照着能调对"。
-- **工具数量失控**：几十个 tool 全量塞进 context，token 先爆，模型选择准确率也降。按需启用、拆 server、粗粒度封装。
-- **进程生命周期**：stdio server 是子进程，崩溃重启、僵尸进程、状态丢失都要有预案，别当成常驻服务。
-- **MCP ≠ 沙箱**：filesystem server 授权了路径就等于给了读写权，真正的鉴权和审计在 server 侧自己实现。
+- **描述即提示词**：模型按 description 选工具。多个语义相近的工具共存时，含糊描述几乎必然选错。写清楚干什么、入参含义、失败时返回什么。
+- **工具数量膨胀**：一个 Server 挂几十个工具，上下文占掉一大截，选择准确率肉眼可见地下滑。按场景拆分 Server，宿主侧按需启用。
+- **非幂等工具遇自动重试会出事故**：Agent 层的重试逻辑碰上"发消息、下单"类工具会重复执行。写操作要么做幂等键，要么在工具内部加确认/干跑机制。
+- **stdio 的环境坑**：Windows 下编码、解释器路径问题会让连接静默失败。先在终端手工跑一遍启动命令，能起来再谈集成。
+- **远程部署别裸奔**：HTTP Server 暴露即公网可达，认证和限流要在网关或 Server 层自己做，SDK 默认不带。
 
 ## 可复用建议
 
-- 一个内部系统封装成**一个** server，暴露 3~5 个粗粒度工具，别一接口一工具。
-- description 当接口文档写，附一个典型调用示例，命中率明显提升。
-- 团队维护一份内部 server 清单：transport、权限范围、owner、版本，避免重复造轮子。
-- 写操作灰度：只读跑一周，确认行为稳定再放开写。
+- 内部系统只写一次 Server、多宿主复用，这是 MCP 最划算的回报点；
+- 粒度宁小勿大，一个工具干一件事，组合逻辑交给模型或编排层；
+- 每次调用落日志（入参、出参、耗时、是否重试），排查 Agent 行为时这是唯一可靠证据；
+- 改工具签名时保持向后兼容，或改名加版本号——宿主缓存的 schema 不会立刻更新。
 
 ## 总结
 
-MCP 不是让模型变聪明的魔法，它只是把"agent 接工具"标准化了。价值在解耦和生态：工具方写一次，宿主任意换，社区现成 server 直接复用。对 OpenClaw-CN 里自己攒 agent、自己接自动化的玩家来说，省下的胶水代码和维护成本，就是它全部的意义。
+MCP 解决的是工程问题，不是智能问题：它把工具接入从一次性定制变成了标准化契约。如果你已经在多个宿主之间重复写适配代码，值得花一个下午跑通最小示例；如果只有一个宿主、三五个工具，原生插件机制够用，不必为了 MCP 而 MCP。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/0e7e470df0160b82.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/e58c7bad97995e1c.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/524591e47194f840.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/4c1494b335db5f35.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/f6e308ee665aea5e.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/14b3433cb1ddebb3.png)
 
