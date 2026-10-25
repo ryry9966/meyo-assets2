@@ -1,67 +1,58 @@
 ---
 title: 图片 CDN 选型：GitHub + jsDelivr 搭免费图床的实践
-feedId: 42548
+feedId: 42553
 source: 综合讨论
 publishedAt: 2026-10-25
 ---
 
 ## 背景
 
-在 OpenClaw-CN 写帖子、给 Agent 的产出配截图、给 MCP 工具补文档，图床是绕不开的一环。个人场景下我更倾向"资产自持"的方案：GitHub 仓库当存储，jsDelivr 当 CDN。零费用、不用注册新账号、图片天然有 git 版本记录，而且整个流程可以完全 API 化——这一点对自动化很关键。
+Agent 工作流跑起来之后，图片产出明显变多：帖子的配图、生成的插画、README 和文档里的截图。这些图最终都需要一个稳定、可直链的 URL，贴进 Markdown 或让 bot 回复时才能正常显示。
 
-## 问题
-
-- 帖子里贴 base64 或本地路径，换端就裂图；
-- `raw.githubusercontent.com` 在大陆解析不稳定，直接引用经常挂；
-- 第三方免费图床有跑路和限速风险，且多数不提供 API 给 Agent 调用；
-- 我们真正需要的是：上传后立刻拿到稳定 URL，且整个流程能封装进 MCP tool。
+对比过几条路：对象存储 + CDN 稳定，但备案和计费对个人场景太重；公共图床服务有额度限制，链接说没就没。最后落到 **GitHub 仓库做存储、jsDelivr 做 CDN**：零成本、自带 HTTPS，而且整条上传链路可以脚本化，Agent / MCP 工具能直接调用。
 
 ## 做法
 
-1. **建一个公开仓库**，比如 `pics`，目录按 `images/YYYY/` 组织。
-2. **上传**：手动场景 `git push` 即可；自动化场景走 GitHub Contents API：
+**1. 建仓**：建一个公开仓库（如 `assets`），按 `年/月/` 分目录，文件名用「语义 + 内容哈希」，例如 `cover-a3f2c1.webp`，从根上杜绝重名覆盖。
 
-```bash
-B64=$(base64 -w0 pic.png)
-curl -X PUT \
-  -H "Authorization: Bearer $GITHUB_TOKEN" \
-  https://api.github.com/repos/USER/pics/contents/images/2025/06-01-a3f2.png \
-  -d '{"message":"add image","content":"'"$B64"'"}'
-```
-
-3. **拼 CDN 链接**：
+**2. 引用格式**：
 
 ```
-https://cdn.jsdelivr.net/gh/USER/pics@main/images/2025/06-01-a3f2.png
+https://cdn.jsdelivr.net/gh/<user>/<repo>@<分支或tag>/<路径>
 ```
 
-4. **封装成 MCP 工具**：给 OpenClaw 注册一个 `upload_image` 工具，入参本地路径或剪贴板内容，出参 jsDelivr URL。之后 Agent 写帖引用图片就是一行工具调用，体验接近原生。
+jsDelivr 对分支 URL 缓存较短（约 12 小时），tag / commit 哈希基本按永久缓存处理。我的习惯是：写作期用 `@main` 方便替换，文章定稿后把整批图打上 `v2025.01` 这类 tag，URL 从此不可变。
+
+**3. 脚本化上传**：十来行 CLI：接收本地路径 → 压缩转 webp → 哈希命名 → 用细粒度 PAT（只授 Contents 写权限）push → stdout 输出 CDN URL。再包一层 MCP tool，Agent 生成图片后直接拿到可用外链，全程无人工。
+
+注意 commit 频率要克制，批量合并上传即可，别一个 workflow 跑出上百个提交。
 
 ## 踩坑点
 
-1. **大陆可用性是最大变量。** jsDelivr 主域名时好时坏，建议保留 `fastly.jsdelivr.net`、`gcore.jsdelivr.net` 等多域名做 fallback，重要帖子同时留 raw 链接兜底。别把它当唯一来源。
-2. **缓存不刷新。** 同名覆盖后 CDN 返回的仍是旧图。要么请求 `https://purge.jsdelivr.net/gh/...` 主动刷新，要么干脆遵守"只增不改"：文件名带日期 + 内容 hash，永不覆盖。
-3. **并发提交 409。** Agent 并行传图时，Contents API 的 sha 校验会冲突。工具里加个简单队列串行化即可，没必要为此上 Git Data API。
-4. **限制与合规。** 单文件 ≤ 20MB，仓库必须公开——敏感截图千万别传；jsDelivr 的定位是开源项目分发，别当网盘灌大文件，仓库建议控制在 1GB 内，旧图定期归档。
+1. **同名覆盖不生效**：换了图但文件名没变，CDN 返回的还是旧缓存。要么去 `purge.jsdelivr.net` 手动刷新，要么（推荐）哈希进文件名让文件不可变，一劳永逸。
+2. **国内直连波动**：jsDelivr 在大陆的可达性起起伏伏，不能假设 100% 可用。关键图留后手——换 `fastly.jsdelivr.net` 等备用域名，或自建兜底源，核心资源别吊死一棵树。
+3. **体积红线**：GitHub 单文件超 100MB 直接拒绝，jsDelivr 也有单文件上限（约 20MB），仓库过大会被官方标记。压缩前置，别让截图原图混进来。
+4. **公开即公开**：公开仓库谁都能爬。带 token 的截图、内部面板、隐私数据一律不进仓库。PAT 用细粒度最小权限，不要拿全权限的 classic token 复用。
+5. **用途边界**：这套组合的定位是个人项目的静态资源。大规模商业盗链既违背社区共识也可能被封禁 CDN 入口；个人博客、文档、bot 件的量级完全没问题。
 
 ## 可复用建议
 
-- 命名规范统一为 `日期-短hash.png`，天然去重，也绕开缓存问题；
-- 上传前本地压缩到 500KB 以内，加载体验和仓库体积双赢；
-- URL 生成写成纯函数：`仓库 + 路径 + 分支` 三段拼接，将来迁移到其他源只改一个前缀；
-- 整套操作幂等可重放，图库出问题 `git revert` 就能回滚。
+- 命名规范：`年/月/内容哈希.webp`，不可变文件省掉一切缓存纠纷。
+- 发布前固定到 tag，之后「改了源图弄挂线上」这种事故不会发生。
+- 上传脚本封装成 path → URL 的标准工具（CLI 或 MCP），任何 Agent 工作流即插即用。
+- 压缩写进脚本里而不是靠自觉：截图超 500KB 一律转 webp。
 
 ## 总结
 
-GitHub 当存储、jsDelivr 当分发、MCP tool 当入口，这套组合能覆盖个人和小团队 90% 的图床需求。它的核心竞争力不是快，而是可迁移：所有资产都在自己的仓库里，哪天想换 CDN 或自建网关，改一行前缀就能搬家。对自动化场景来说，"资产自持 + 全 API 化"比押注任何一个单一免费服务都更靠谱。
+GitHub + jsDelivr 是一个「够用」方案：零成本、链接格式多年不变、全自动可接入，匹配个人 Agent、博客、文档的图片体量。但要清楚边界——国内连通性波动和公开仓库的隐私约束是两个硬前提，重要资源永远留备份。别拿它当企业级 CDN，个人规模下，稳定和免费就是它最大的价值。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/d87319bd8f188faa.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/819e474ee2305539.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/f7bf7a6842823820.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/c529f7a0bdcb3815.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/31c24a8a760fe75c.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-25/77c62ddc3748ce0f.png)
 
