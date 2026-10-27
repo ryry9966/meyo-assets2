@@ -1,57 +1,71 @@
 ---
 title: OpenClaw 的 session 隔离：子 Agent 怎么不污染主会话
-feedId: 42699
+feedId: 42729
 source: 综合讨论
 publishedAt: 2026-10-27
 ---
 
 ## 背景
 
-OpenClaw 里每个 agent 都有独立的 session 存储，主会话一般绑定某个 IM 渠道或定时入口，是长期运行的编排中枢。跑得久之后会遇到一个经典问题：主 agent 自己干重活——批量读文件、抓网页、长链路推理——几十条 tool call 和大段输出全部落进同一个 transcript，上下文迅速膨胀。
+用 OpenClaw 跑长任务时，主会话通常是"总调度"，需要把活拆给子 agent：批量搜索、读一堆文件、跑脚本验证。理想状态是子 agent 干完只交一份结论。但实际用下来，子 agent 的中间过程——工具原始输出、报错重试、大段文件内容——很容易原样回流到主会话，上下文迅速被撑爆。
 
 ## 问题
 
-不隔离的代价很具体：
+几个典型症状：
 
-- token 成本和 compaction 频率同步上升，早期指令容易被压缩掉；
-- 主 agent 被中间过程淹没后丢焦点，编排质量下降；
-- 重放主会话排障时噪音极大，关键决策被工具输出埋掉。
+- 主会话 token 涨得飞快，跑几轮就触发截断/压缩，原计划丢一半；
+- 子 agent 某次失败的重试记录留在主会话里，主 agent 后续决策被这条失败带偏；
+- 子 agent 覆盖了共享的工作目录或记忆文件，主流程读到脏数据。
+
+根因往往不是"子 agent 不听话"，而是三样东西没隔开：**会话、工作区、返回内容**。
 
 ## 做法
 
-1. **派生而不是原地执行**。用 `sessions_spawn` 把重活交给子 agent：子任务拿到全新的 session id 和独立 transcript，与主会话上下文物理分离。
-2. **任务简报自包含**。子 agent 默认看不到主会话，spawn 时要把目标、输入路径、约束、交付格式、停止条件一次写全，当成给新同事发需求文档。
-3. **限定回传**。明确要求只返回一段有界摘要，由主会话决定是否 announce 到渠道；中间 tool call 留在子 session 里。
-4. **配置层再补一刀**。agents 各自配 workspace、模型和工具白名单；涉及文件写操作就开 Docker sandbox；memory 目录按 agent 拆开，避免互相覆盖。
-5. **验证**。到 `~/.openclaw/agents/<id>/sessions/` 确认生成了独立 jsonl，主会话里只应看到 spawn 调用和最终摘要。
+**1. 子 agent 用独立 session。** spawn 子任务时不要复用主会话的 session key，给每个子任务独立 ID（示意配置，具体参数名以你版本的文档为准）：
+
+```json
+{
+  "tool": "sessions_spawn",
+  "args": {
+    "task": "调研 xxx 并给出结论",
+    "sessionKey": "sub:research-0712",
+    "mode": "summary"
+  }
+}
+```
+
+关键是返回模式用 summary 或 structured，主会话只收一份结论，不收过程。
+
+**2. 大产物落盘。** 子 agent 把长文本、抓取结果写进自己的 scratch 目录，返回里只给路径加一句话结论。主会话需要细节时再按需读片段，而不是默认全量进上下文。
+
+**3. 工具权限收敛。** 子 agent 只挂它需要的 MCP/插件，能只读就只读。不要让子 agent 拿到能写主会话状态或全局配置的权限——隔离不只为了省 token，也为了安全。
+
+**4. 验证一下。** 跑一个任务，前后各看一眼主会话 token 数和 sessions 目录（一般在 `~/.openclaw` 下），确认子会话 transcript 落在独立文件里，主会话的增量就是那一小段摘要。没达标就说明某条链路还在漏。
 
 ## 踩坑点
 
-- 默认假设子 agent 能"看到"主对话——它看不到，缺的上下文必须显式给；
-- 摘要不设上限，回传直接把渠道刷屏；
-- 多个 agent 共写同一个 memory 文件，造成跨会话污染，改成 per-agent 目录或只读挂载；
-- 子 agent 的 sandbox 权限和主 agent 不一致，静默失败，先查 gateway 日志再怀疑提示词；
-- 子 agent 里再 spawn，形成递归，要限制深度和并发；
-- 排障时发现主 transcript 里没有子 agent 的推理过程——这是特性不是 bug，去翻对应的子 session 文件。
+- **在主会话里直接调长输出的 MCP 工具**，输出照样写进主上下文。该下沉的调用要包进子 agent，这是最容易漏的一条。
+- **子 agent 默认继承主会话记忆**。有些配置这显得"贴心"，实际会串味：子 agent 拿着主会话半截计划自行发挥。显式关掉继承。
+- **共享 scratch 目录撞文件名**。两个子 agent 并发写 `result.json`，谁覆盖谁全看运气。按 session key 建子目录。
+- **返回模式图省事用 full**，等于没隔离。同理，重试也应该发生在子会话内部，主会话只该看到"试了三次，最终结论是 X"。
 
 ## 可复用建议
 
-- 固化一份 spawn 简报模板（目标 / 输入 / 约束 / 输出 / 停止条件），随用随填；
-- 一次 spawn 只干一件事，不要复用子 session 塞不相关任务；
-- 主会话定位成调度器：拆解、派发、验收，不亲自搬砖；
-- 定期清理过期 session 文件并监控目录体积，尤其是高频自动化场景。
+- 定个粗略阈值：预计输出超过几 KB、或步骤超过十几步的活，一律进子 agent。
+- 固化一份"子 agent 契约"：输入走参数或文件，输出是一份结构化摘要，其余产物落盘。契约稳定后，主会话 prompt 都不用改。
+- 主会话只做规划和汇总，定期 compact；子会话 transcript 留在磁盘上，排障时再翻。
 
 ## 总结
 
-子 agent 隔离的本质就三件事：**独立 transcript、显式上下文交接、有界回传**。把主会话当成 dispatcher，把脏活和噪音关进子 session，主链路才能长期保持干净可控。具体参数以你当前版本文档为准，但这套模式在多 agent 编排里是通用的，值得直接固化成团队的 spawn 规范。
+session 隔离的本质就三件事：**会话分开、工作区分开、返回收窄成摘要**。把主会话当调度器，子 agent 当干活的临时工——干完活只交报告，不把工地搬回办公室。做到这点，长任务的上下文曲线会平稳很多。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-27/c38e78a5f6ad4d8c.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-27/452f5058553a0851.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-27/3c79c16e5a810b7a.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-27/23507faecfcdd3a4.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-27/f10aef419d9045f8.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-27/1532016a094cf753.png)
 
