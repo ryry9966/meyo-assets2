@@ -1,67 +1,80 @@
 ---
 title: Agent 的 tools.md：管理本地配置和环境差异的正确姿势
-feedId: 42818
+feedId: 42830
 source: 综合讨论
 publishedAt: 2026-10-28
 ---
 
-跑 Agent 的人通常不止一台机器：开发笔记本、家里的服务器、一台 VPS，再加上 CI。同一个项目，Agent 在 A 机上用得好好的，切到 B 机就开始瞎猜——Python 在哪个 venv、端口被谁占了、某个 MCP server 到底起没起。我们的做法是把这类"机器事实"收敛到一个 `tools.md` 里，让 Agent 每次会话启动时先读它。它不是又一个 README，而是 Agent 和这台机器之间的契约。
+## 背景
+
+Agent 用久了会发现，摩擦最大的往往不是模型能力，而是"这台机器和那台机器不一样"。在 OpenClaw 的 workspace 里，AGENTS.md 管行为约束，而 tools.md 的定位很明确：告诉 Agent 这套环境里有什么、该怎么用。实际情况是，很多人要么不写，要么把它写成了第二份 README。
 
 ## 问题
 
-把所有信息写进一个文件，会撞上三类麻烦：
+几个典型翻车场景：
 
-1. **环境差异**。绝对路径、版本号、GPU 有无，这些因机器而异，直接提交进仓库就是灾难。
-2. **时效性**。手写的配置必然腐化。升级了 Node 忘了改文件，Agent 拿着过期信息继续干活，错误还不好归因。
-3. **上下文成本**。把所有细节塞给 Agent，token 花在没用的地方，还稀释了真正重要的指令。
+- 同一 workspace 通过 git 同步到三台机器：MacBook、家里的小主机、一台 GPU 盒子。Agent 在 Mac 上习惯性 `brew install`，而 Debian 上根本没有 brew；
+- 路径漂移：`/Users/a`、`/home/a`、`/mnt/data` 各不相同；
+- 团队共用仓库，Python 环境管理器不统一（conda / uv / 系统 pip），Agent 按文档装包，装错了地方；
+- 更隐蔽的是文档腐烂：环境早变了，tools.md 还在"说谎"，Agent 理直气壮地按错误事实行动。
+
+根因只有一个：把 tools.md 当静态文档，而不是需要与真实环境保持一致的状态描述。
 
 ## 做法
 
-核心思路一句话：**不变的进模板，善变的本机生成，每条事实可验证**。分三层：
+**1. 先定纪律**：tools.md 只写"能被一条命令验证的事实"。验证不了的内容（偏好、任务流程）归 AGENTS.md。
 
-**第一层：`tools.template.md`（入库）**。只写与机器无关的约定：有哪些工具、命名习惯、调用规范。比如"本地索引服务用 `indexd`，不要自己占 8000 端口"。
+**2. 三层结构**：
 
-**第二层：`tools.local.md`（gitignore）**。只写本机事实：venv 路径、实际版本、监听端口、哪个 MCP server 在跑。不放密钥本体，只放指针（"token 在 `~/.config/xxx`，经环境变量注入"）。
+- 全局节：shell、平台、通用约定，各机一致的部分；
+- 分机器节：以 hostname 为锚点，如 `## host: studio-mac`，节前注明"先执行 hostname，再读对应小节"；
+- 个人覆盖：`tools.local.md` 放私有内容（内网别名、个人路径），加入 gitignore，只在本机生效。
 
-**第三层：探针脚本生成**。与其手写，不如让脚本探测后校验：
+**3. 写法用「事实 + 校验命令」，不写顺序步骤**：
 
-```bash
-# probe.sh：探测并 diff，差异只提示不覆盖
-python3 -c "import sys; print(sys.version.split()[0])"
-command -v indexd || echo "MISSING: indexd"
+```markdown
+# Tools
+## Global
+- 密钥一律走环境变量，变量名见 .env.example，不要索要明文
+
+## host: studio-mac
+- 包管理：brew；Python 用 uv（校验：command -v uv）
+- 工作区 ~/work，未列出的路径先询问
+
+## host: lab-gpu
+- 包管理：apt + conda env torch
+- GPU 任务先跑 nvidia-smi 确认空闲
 ```
 
-挂在会话启动前跑一次，Agent 读到的永远是刚探测过的现实。
+对比一下：差的写法是 `1. pip install -r requirements.txt`；好的写法是"本机用 uv，没有 uv 时先报告，不要自行 pip install"。前者是脚本，后者是事实加守门条件。
 
-**加载顺序**：template → local → 会话内临时覆盖，local 里的同名字段覆盖模板。
-
-**每条事实带验证命令**。这是最值得的一条：与其写 "node 20"，不如写 "node，验证：`node -v` 期望 v20.x"。Agent 拿不准时自己跑一下，而不是猜。
+**4. 维护闭环**：装了新工具、换了路径，随手让 Agent "对照当前机器自检 tools.md，列出不符项"，人工确认后更新。文档腐烂多半是缺了这一步。
 
 ## 踩坑点
 
-- **别让 Agent 随便写 `tools.local.md`**。它可以提议更新，但要人审 diff，否则文件会漂移成它的想象。
-- **别写太长**。这个文件每次会话都进上下文，一条事实一行，超过百行就该砍。放不下的细节让 Agent 按需去读别的文档。
-- **会话中途改了环境要明说**。Agent 只在启动时读一次，中途升级了依赖就直接告诉它，别指望它重读。
-- **CI 里别提交生成物**。CI 现场跑探针脚本生成，仓库里只有模板。
-- **路径分隔符**。团队里有 Windows 机器时，模板统一写正斜杠，local 层由脚本归一化，省得 Agent 自己拼错。
+- 明文写密钥、内网 IP、token 后 push 到远端。tools.md 会进模型上下文，也会进 git 历史，删了也还在；
+- 写成脚本式步骤清单，Agent 会机械顺序执行，一步失败后行为不可控；
+- 无限膨胀：tools.md 每次会话都占上下文，堆到几百行会挤压真实任务，条目之间还会互相冲突；
+- 多机共用 workspace 却不设分机器节，指望 Agent "自己判断"，判断错一次就是一次事故。
 
 ## 可复用建议
 
-- 文件分四个 section 就够：`runtime` / `paths` / `services` / `verify`，别发明复杂 schema。
-- 把探针脚本当测试用例写：每条事实对应一条探测命令，脚本非零退出码就是环境不达标。
-- 换新机器的第一件事是跑探针、生成 local 文件，五分钟搞定，比事后排障便宜得多。
+- 一条内容去留的判断标准：能否用一条命令验证？不能就移走或删掉；
+- tools.md 管机器层事实，项目层差异放项目目录内的说明文件，别全塞一个文件；
+- 新环境初始化时，先让 Agent 探测并生成 tools.md 草稿，再人工修剪，比从零手写快得多；
+- 把"文档与现实的 diff"当例行维护项：环境变更后自检一次，人工确认一次。
 
 ## 总结
 
-`tools.md` 的价值不在文件本身，而在于把"环境事实"从 Agent 的猜测量变成可探测、可验证、分层的输入。模板管不变量，本机文件管差异，脚本管时效，验证命令管兜底。做到这四点，同一套 Agent 配置在几台机器之间切换，就不用再碰运气了。
+tools.md 的价值不在于写了多少，而在于 Agent 相信它时不会出错。把它当成环境的状态快照：分层组织、每条可验证、密钥外置，再配一个 tools.local.md 做个人覆盖，多机与协作的漂移问题基本能压住。写环境文档这件事，频率比篇幅重要。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-28/6a8b3ddf54722b66.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-28/81342fc59423070c.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-28/b0c7dc19dde97acf.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-28/a76b36d8c82fb695.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-28/1f00111a7289ab68.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-28/362d5c83ceac1833.png)
 
