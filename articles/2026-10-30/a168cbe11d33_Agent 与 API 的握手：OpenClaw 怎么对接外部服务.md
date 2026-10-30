@@ -1,70 +1,63 @@
 ---
 title: Agent 与 API 的握手：OpenClaw 怎么对接外部服务
-feedId: 42988
+feedId: 43055
 source: 综合讨论
 publishedAt: 2026-10-30
 ---
 
+# Agent 与 API 的握手：OpenClaw 怎么对接外部服务
+
 ## 背景
 
-Agent 的价值不在会聊，而在能"动手"。在 OpenClaw 里，Agent 触达外部服务通常有三条路：让模型直接跑 shell/curl、接入 MCP server、写本地插件把服务封装成 tool。第一条适合探索期验证可行性，真正要长期跑的对接，基本都落在后两条上。
+Agent 本体只是推理循环，真正决定它“能干什么”的，是它手里有哪些工具。OpenClaw 作为常驻的 agent 运行时，对接外部服务（内部 API、SaaS、数据网关）几乎是上生产前的必经一步。我们最近把三个内部服务接进了 OpenClaw，把过程和教训整理如下。
 
 ## 问题
 
-很多人把"能调通"当成"对接完成"。demo 里一次调用成功，放到日常任务里问题就来了：鉴权过期没人管、接口偶发超时、Agent 重试导致重复写操作、返回体太大把上下文撑爆。这些才是对接的真实成本，得在设计阶段就想清楚。
+直接“让模型调 API”会立刻撞上几件事：
 
-## 做法：以一个 MCP server 为例
+- **鉴权**：密钥放哪，怎么保证不进 prompt、不进日志；
+- **契约**：模型对参数的理解完全靠工具描述，描述写得糊，调用就是玄学；
+- **容错**：超时、限流、5xx，模型拿到一坨堆栈只会瞎猜；
+- **上下文**：返回体一大，几轮对话就把窗口吃光。
 
-假设要把内部的工单 REST 服务交给 Agent 使用，我的步骤是：
+## 做法
 
-1. **按动作切 tool，不按接口切。** 不要把整个服务包成一个万能 tool，而是拆成 `create_ticket` / `query_ticket` / `close_ticket`。tool 粒度对应 Agent 的"意图"，模型选起来才不容易错。
-2. **鉴权下沉到 server 侧。** API key 放环境变量，tool 参数里永远不出现凭证字段，Agent 只传业务参数。
-3. **把约束写进 description。** 必填项、取值范围、格式示例都写进 schema 描述。模型是靠描述理解工具的，这里省一句话，线上就多一类报错。
-4. **错误返回要"可行动"。** 返回结构化错误加下一步建议，而不是抛堆栈。模型看到 "timeout，可先 query 确认是否已创建" 是能自己决策的。
-5. **返回体做裁剪。** 只回字段白名单，列表强制分页，别让一次调用吃掉半个上下文窗口。
+OpenClaw 里对接外部服务主流三条路：MCP server、插件、自定义 HTTP 工具。选择标准很简单——有现成 MCP 就复用，内部 API 用插件包一层，零散接口用 HTTP 工具。
 
-骨架大致长这样：
-
-```python
-@mcp.tool()
-def create_ticket(title: str, priority: str = "normal") -> dict:
-    """创建工单。priority 仅接受 low / normal / high。"""
-    try:
-        resp = http.post(f"{BASE}/tickets", json={"title": title, "priority": priority},
-                         headers=auth_header(), timeout=8)  # 凭证从环境变量读
-        resp.raise_for_status()
-        d = resp.json()
-        return {"id": d["id"], "status": d["status"]}
-    except requests.Timeout:
-        return {"error": "timeout",
-                "hint": "服务 8s 未响应，可稍后用 query_ticket 确认是否已创建"}
-```
+1. **盘点接口**：列出要暴露的操作、读写属性、副作用。原则是先只读，跑稳了再放开写操作。
+2. **定工具边界**：一个工具干一件事。宁可 `get_order` / `cancel_order` 拆开，也别做万能接口靠枚举分发。
+3. **鉴权托管**：密钥进环境变量或凭据存储，由插件运行时注入，绝不落入对话上下文和日志。
+4. **写工具描述**：把“什么时候该用、什么时候不该用、参数格式、典型错误”写进 description——这部分就是给模型看的 API 文档。
+5. **返回瘦身**：服务端只回关键字段；报错返回结构化短消息（错误码 + 一句人话），别把堆栈原样丢给模型。
+6. **超时与重试**：插件层统一超时（我们用 10s）、指数退避重试，写操作带幂等键。
+7. **灰度验证**：先在测试会话里跑真实但低风险的数据，观察调用日志，再逐步放开。
 
 ## 踩坑点
 
-- **写操作 + 自动重试 = 重复下单。** 没有幂等键时，一次超时重试就是两笔数据。要么服务端支持 idempotency key，要么写操作不做自动重试，交给确认环节。
-- **超时要对齐。** tool 侧超时设得比上游网关还长，等于没设。宁可 fast fail，把决策权还给 Agent。
-- **schema 漂移。** 上游改了字段，tool 不报错但行为变怪。对关键响应做最小校验（必填字段存在、类型正确），早失败早暴露。
-- **别在 tool 里堆业务逻辑。** tool 只做"翻译"，判断留给 Agent 或独立工作流。混在一起，出问题时说不清是模型的错还是代码的错。
+- 工具描述一句话带过，模型在相近工具间乱选。补成三行说明后，误调率明显下降。
+- 某接口默认返回全量 JSON，单次调用 40KB token，直接撑爆对话。加字段白名单后降到 1KB。
+- 写操作没做幂等，模型超时重试导致重复建单。幂等键必须由插件层生成并放请求头。
+- 密钥曾通过错误信息回显到对话——**错误处理也要脱敏**。
+- 把额度、权限这类规则校验交给模型判断。规则类校验应留在插件层，模型只做编排。
 
 ## 可复用建议
 
-- 一个外部服务对应一套薄 tool：鉴权、超时、重试策略收敛在同一处，改起来只动一处。
-- 读操作放开，写操作默认 dry_run 或 require_confirm。
-- 配一个 `ping`/healthcheck tool，Agent 拿到新环境能先自检连通性，省掉大量来回试探。
-- 错误信息模板化：发生了什么 + 为什么 + 下一步建议，三段式。
+- 把工具 schema 当提示词的一部分来打磨，收益通常高于反复改系统提示词。
+- 只读先行、写操作灰度、全量审计日志，三件套缺一不可。
+- 返回给模型的数据按“它下一步要做什么”裁剪，而不是按接口原始结构透传。
+- 每个工具维护一条最小可复现的调用样例，方便回归测试。
 
 ## 总结
 
-对接外部服务，本质是给 Agent 一份**有边界的权限**，再加一份**能读懂的说明书**。tool 做得越薄、约束写得越显式、错误越可行动，Agent 的行为就越可预测。OpenClaw 侧多花的每一分收敛功夫，最后都会变成线上少熬的夜。
+对接外部服务不是“接根网线”，而是给 Agent 立契约：边界清晰、鉴权托管、失败可读、副作用可控。OpenClaw 的 MCP + 插件机制已经把管道铺好，剩下的工程活在于工具设计的粒度和克制。先让它安全地读，再谨慎地写——这次握手才算真正握上。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/301331209c0e790d.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/7c1489529968e4e8.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/e7c8da9e35e5e0ca.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/873ef7ea7f39d225.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/eda75f4a6286162b.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/4d3ea27e51eb59db.png)
 
