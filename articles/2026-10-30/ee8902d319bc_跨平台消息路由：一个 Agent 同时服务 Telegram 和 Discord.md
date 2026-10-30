@@ -1,83 +1,86 @@
 ---
 title: 跨平台消息路由：一个 Agent 同时服务 Telegram 和 Discord
-feedId: 42976
+feedId: 42993
 source: 综合讨论
 publishedAt: 2026-10-30
 ---
 
+# 跨平台消息路由：一个 Agent 同时服务 Telegram 和 Discord
+
 ## 背景
 
-我们团队和社区用户分散在两处：日常沟通在 Telegram 群，项目讨论和公告在 Discord 服务器。之前是两个独立 bot，问题很明显：记忆不互通、prompt 和 skills 维护两份、同一个人换个平台 Agent 就"失忆"，修个问题还要改两处。
+我们的 OpenClaw agent 最初只接了 Telegram，个人和小群用着没问题。后来团队协作搬到 Discord，割裂就出现了：同一批人要在两个平台分别 @ 两个 bot，agent 的记忆、工具和任务状态各一份。目标很朴素——一个 agent 实例、一份记忆，两个入口都能用，必要时还能跨平台传话。
 
-目标很朴素：跑一个 Agent 实例，两个平台只是两个入口，能力和记忆完全一致。
+## 问题
 
-## 问题拆开看
+拆开看是四件事：
 
-真正要解决的只有三件事：
-
-1. **会话归属**：同一个用户从 TG 和 Discord 进来，上下文怎么算？
-2. **消息形态**：两边的 markdown 方言、长度上限、编辑与回复行为都不同。
-3. **运行时**：双通道并发、平台限流、长任务阻塞主循环。
+1. **接入**：Telegram 走 long polling，Discord 走 gateway websocket，两套事件模型；
+2. **会话归属**：消息进来后路由到哪个 session，不同群、不同人不能共享上下文；
+3. **格式差异**：Markdown 方言、长度上限（Telegram 4096 / Discord 2000）、附件、引用回复各不相同；
+4. **回程路径**：agent 的回复和工具产出的消息，怎么决定发回哪个平台。
 
 ## 做法
 
-**1. 单 Gateway，双通道，单 Agent**
+### 1. 双通道接入，adapter 归一化
 
-OpenClaw 的架构天然适合这个场景：Gateway 收敛消息入口，通道只是适配器。一份配置同时声明两个通道，agent 绑定同一实例：
+gateway 同时挂两个 channel，token 各自申请，两个 adapter 并行跑。关键是业务逻辑不感知平台差异，归一化在 adapter 层完成：
 
-```jsonc
-{
-  "channels": {
-    "telegram": { "botToken": "TG_TOKEN", "dmPolicy": "pairing" },
-    "discord":  { "token": "DC_TOKEN", "intents": ["guildMessages"] }
-  },
-  "agents": { "default": { "workspace": "~/agent-workspace" } }
-}
+```yaml
+channels:
+  telegram:
+    enabled: true
+    mode: polling
+  discord:
+    enabled: true
+    intents: [guild_messages, dm_messages]
 ```
 
-**2. 会话按"通道 + chat id"隔离**
+统一后的内部消息模型：`{ channel, chat_id, thread_id?, sender, text, attachments[], reply_to }`。
 
-默认 session scope 设为 per-chat，两个平台互不串台，排查问题也干净。需要跨平台连续性（比如用户在 TG 发起任务、回 Discord 看结果）时，靠共享 workspace 文件和长期记忆承接，而不是共享会话——实践下来这样最不容易出诡异 bug。
+### 2. Session 路由
 
-**3. 身份映射**
+session key 用 `(channel, chat_id, thread_id)` 三元组，同一个 agent，不同 key 不同上下文：
 
-建一张内部 user 表：平台 user id → 内部用户。权限、记忆、配额都挂在内部用户上，通道只是登录方式。
+- Telegram 群 A 和 Discord 频道 #dev 是两个独立 session；
+- Discord 的每个 thread 单独成 session，避免话题互相污染；
+- DM 走 `(channel, sender)` 作为 key。
 
-**4. 出站渲染下沉**
+### 3. 回程路由
 
-Agent 内部只产出一份规范 markdown，每个通道配一个很薄的 renderer：处理转义（TG 用 HTML parse_mode 省心）、分片（Discord 2000 字符、TG 4096）、@提及格式差异。**不要**让平台语法混进 agent 上下文。
+回复默认回原路（reply-to-source）。跨平台发送做成显式的 MCP 工具，比如 `send_message(channel, target, text)`，让模型在明确意图时才调用，而不是隐式广播。
 
-**5. 出站队列 + 异步长任务**
+### 4. 出站统一适配
 
-每通道一个带指数退避的发送队列；长任务先回一条 ack，算完再推送结果，避免阻塞主循环拖死另一边。
+出站统一走一个 dispatcher：按目标平台重排 Markdown、超长自动分段、附件转链接。分段逻辑放 dispatcher 而不是各 adapter，保证两端行为一致。
 
 ## 踩坑点
 
-- **Telegram 409 conflict**：两个进程同时 polling 就会报错。webhook 和 polling 只能选一个，重启前确认旧进程清干净。
-- **Discord 收不到消息正文**：MESSAGE CONTENT intent 没开时，bot 只能看到空消息，很容易误判为 Agent 出错，先查后台开关。
-- **TG 编辑限流**：流式输出高频 editMessageText 会触发 429，按 1.5–2 秒间隔合并编辑；Discord 则用 typing 状态 + 一次性发送。
-- **DM 与群聊 session key 撞车**：同一用户私聊和群聊要分 session，否则上下文互相污染。
-- **媒体路径**：两边下载限制不同，统一落盘到 workspace 固定目录，agent 只引用路径。
+- **自激循环**：agent 在 Discord 发的消息会被自己的 gateway 再次捕获。必须在入口过滤自身 bot id，以及被 agent @ 到的其他 bot 的纯回显。
+- **Markdown 转义**：Telegram MarkdownV2 的转义规则极严格，`_`、`[`、反引号都可能直接 400。我们最终放弃 MarkdownV2，统一走 HTML 子集。
+- **429 退避**：Discord 短时间多分段容易触发限流，dispatcher 里加了全局令牌桶，并尊重 retry_after。
+- **群聊上下文污染**：群里所有闲聊都进 session 会很快炸掉。加两层过滤——只响应 @提及/回复 bot 的消息，其余作为低权重背景记录。
+- **附件时效**：Discord CDN 链接有签名时效，第二天就失效。转存到自己的对象存储后再交给 agent。
 
 ## 可复用建议
 
-- 通道适配器保持"薄"，所有业务逻辑进 agent/skills。将来加第三个平台（比如 Slack）只是多一个 adapter。
-- 先设计统一消息信封：文本、引用、附件、回复目标、优先级，渲染器只消费信封。
-- 每通道独立 feature flag，一个通道故障不影响另一个。
-- 录几条真实入站消息做 fixture，升级前回放做回归。
-- 监控按通道拆：发送失败率、端到端延迟、429 次数，出问题一眼定位是哪边。
+1. **先做消息归一化，再加通道**。adapter 只做翻译，业务永远面对统一模型，以后接新平台就是新写一个 adapter。
+2. **session key 三元组是这套架构里最值钱的决定**，上线至今没为路由改过业务代码。
+3. **跨平台动作必须显式**。隐式同步（A 平台消息自动搬到 B）我们试了一周就关掉：噪音大、上下文膨胀、用户不信任。显式工具调用才可控。
+4. **路由决策留日志**。`msg_id → session_key → reply_channel` 一条链路日志，排障时间少一大半。
+5. 灰度路径：先做单向推送（摘要搬运），稳定后再放开双向和主动消息。
 
 ## 总结
 
-跨平台路由的工程量不大，难点在于把平台差异**挡在渲染层和队列层**，让 Agent 完全不感知"自己挂在哪个平台"。原则一句话：单 Agent、多通道、会话隔离、渲染下沉。跑稳之后，加新通道基本是纯增量工作。
+一个 agent 服务多平台，难点不在"接上"，而在路由与格式这两层基础设施。adapter 做薄、session key 设计好、跨平台动作显式化，这三件事做对，剩下的就是常规运维。目前这套结构正在接入第三个通道，新增成本基本就是写一个新 adapter。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/fc2233d684342ca0.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/1c0e53bfa98ef89b.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/f72f63d9467b3bc7.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/d6124b9a2c685657.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/0d9598169bade5cd.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-10-30/7d54ec27e2078014.png)
 
