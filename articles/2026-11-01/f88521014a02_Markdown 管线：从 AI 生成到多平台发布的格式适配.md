@@ -1,61 +1,64 @@
 ---
 title: Markdown 管线：从 AI 生成到多平台发布的格式适配
-feedId: 43111
+feedId: 43140
 source: 综合讨论
 publishedAt: 2026-11-01
 ---
 
 ## 背景
 
-用 OpenClaw 这类 Agent 做内容生产，Markdown 几乎是默认交付格式：模型输出是 Markdown，MCP 工具读写的是 Markdown，插件的输入输出也大多围绕它。真正的麻烦在最后一公里——同一篇稿子要发公众号、知乎、掘金、GitHub README 或静态博客时，你会意识到“Markdown 只是中间格式”，每个平台都有一套自己的限制。
+我们的内容流程已经稳定为：Agent 起草 → 人工修订 → 多平台分发。AI 输出的统一是 Markdown，但下游五花八门：静态站要 front-matter，公众号要内联样式的 HTML 加自家图床，知乎、掘金的编辑器各有各的兼容性。早期每个平台手动改一遍，一周三篇、发四个渠道，格式工作比写作本身还费时间。后来把这件事做成了管线，这篇记录核心设计与踩坑。
 
-## 问题
+## 问题拆开是三类
 
-我们最初的流程很朴素：Agent 写完，人工复制粘贴。问题很快暴露：
-
-1. 公众号不认标准 Markdown，只接受内联样式的 HTML，`<style>` 标签直接被剥离；
-2. AI 输出不稳定：有时代码块不标语言，有时围栏里又嵌一层围栏，有时夹带裸 HTML；
-3. 图片相对路径在目标平台全部失效，各平台图床互不相通；
-4. frontmatter、脚注、任务列表这类扩展语法，部分平台会原样渲染出来，观感很尴尬。
+1. AI 输出不稳定：标题层级漂移（有时一级有时三级）、代码块语言标签缺失、偶发把整篇包进一层多余的代码围栏。
+2. 平台限制：公众号防盗链导致外站图全裂、外链会被吞；部分平台表格和公式语法不兼容。
+3. 状态不可追溯：发布记录缺失，重跑脚本就重复发布，或把线上文章覆盖成草稿。
 
 ## 做法
 
-我们把管线拆成四层，核心原则是：**规范化在代码里做，不靠 prompt**。
+原则一句话：一条规范化链路 + N 个平台适配器；不要用正则改 Markdown，全程走 AST。
 
-**第一步，定义方言契约。** 明确 Agent 允许输出的 Markdown 子集：ATX 标题、带语言标注的围栏代码块、GFM 表格（不超过 5 列）、禁裸 HTML、禁脚注、链接一律绝对地址。把它当成 API contract 写进文档，system prompt 只引用、不复述。
+**第一步，规范化。** 用 remark（mdast）做 lint/fix：标题压平到单一 H1、补全代码块语言、HTML 节点尽量转回 Markdown、统一中英文间距。规范化后的 canonical Markdown + front-matter 是唯一事实源。
 
-**第二步，lint 与归一化。** 产出后先过校验：markdownlint 自定义规则兜底，再加一个归一化脚本处理已知脏数据——剥 HTML、脚注转行内括号、无语言代码块补默认标注、frontmatter 抽出存为元数据。prompt 会漂移，代码不会。
+**第二步，适配器。** 每个目标平台一个插件，接口统一：
 
-**第三步，渲染适配层。** 用 remark/unified 串联：`remark-parse` 解析 → 自定义转换插件 → 按目标平台走不同 rehype 分支。公众号分支最麻烦，要遍历 AST 给每个元素注入内联 CSS，代码块预渲染成带高亮的 `span`；掘金、知乎走标准 Markdown 透传，只做图片链接重写；静态博客直接透传。
+```js
+// 每个适配器实现两个方法
+transform(ast) -> 平台格式   // 公众号：内联样式 HTML + 图床重写
+validate(ast) -> issues[]   // 发布前静态检查
+```
 
-**第四步，工具化。** 把整条管线包成 `publish(target)` 的 MCP 工具暴露给 Agent。Agent 只负责产出规范 Markdown，调用工具之后是纯确定性流程。图片上传按内容 hash 缓存，失败走重试队列。
+公众号适配器最重的三件事：图片先走上传 API 换成站内 URL 并回写节点；外链降级为文末引用列表；样式全部内联（思路同邮件模板）。静态站适配器最简单，注入 front-matter 落盘即可。
+
+**第三步，校验与发布。** validate 全绿才调平台 API，默认只发草稿、人工点发布；发布成功后把平台文章 ID 和内容 hash 写进本地清单，幂等去重全靠这张表。
 
 ## 踩坑点
 
-- 公众号对样式清洗比想象中狠：行内样式里 `position`、部分伪类会被剥掉，主题 CSS 要单独维护并定期实测；
-- 表格在手机端必炸，超过 3 列就降级成列表；
-- 图片上传是异步且限速的，先落本地队列再提交，别让 Agent 同步干等；
-- 代码高亮如果用 class，公众号同样会剥，必须编译成 `span` + inline color；
-- frontmatter 忘删，发出去就是一篇以 `---` 开头的文章，我们犯过不止一次。
+- 最大坑：用正则处理 Markdown。代码围栏里出现特殊字符就全盘皆输，AI 偶尔用四反引号嵌套围栏更是直接漏匹配。换 remark 后这类 bug 清零。
+- 公众号外链图片不处理，隔几天必然裂图。上传加重写必须做成发布前置步骤，别想着事后补。
+- front-matter 忘记剥离，正文开头挂着一块 `---`，读者一头雾水。
+- 公式语法：`$...$` 与 `\(...\)` 各平台渲染不一，适配器里做统一转换。
+- 别信“这次只是小改”，清单里没有的 hash 一律先发草稿。
 
 ## 可复用建议
 
-1. 方言越窄越好，文档化并版本化，当成接口维护；
-2. 每个平台适配器写成纯函数：规范 Markdown + 配置 → 平台 payload，方便单测和回放；
-3. 保留 canonical 源文件，渲染结果与源文件做 diff 记日志，排障时能快速定位是哪一层引入的变形；
-4. 图片按 hash 缓存 + 引用计数，多平台复用同一张图只上传一次。
+- canonical Markdown 定成 schema，front-matter 交给 JSON Schema 校验。
+- 所有适配器支持 dry-run：只产出本地工件不发请求，方便 diff 审查。
+- 每个适配器配 golden file 快照测试，渲染器升级跑一遍就知道改了什么。
+- 在 OpenClaw 的 Agent 工作流里，把 `publish_markdown(target=...)` 封装成 MCP tool，Agent 起草完可直接调用，人只守最后一道草稿审核。
 
 ## 总结
 
-这条管线的本质，是把“格式适配”从 Agent 的一次性发挥，变成可测试的确定性代码。Agent 的能力边界是生成，工程的价值在于收敛。管住方言、管住资产、管住平台差异，一份 Markdown 才能真正做到一次生成、处处可发。
+这条管线没有高深技术，本质是“先规范化、再分发、发布状态可追溯”。价值在于把格式问题从每次发布的手工劳动，变成一次性的工程投入。后来新增一个分发渠道，基本就是多写一个适配器的事了。
 
 ---
 
 ## 配图
 
-![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-11-01/635727802fa17d8d.png)
+![cover](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-11-01/94a5e208abaafb19.png)
 
-![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-11-01/1a21930a61fe05ee.png)
+![img1](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-11-01/0f4f5862d7c1494c.png)
 
-![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-11-01/bd633dac3997efe0.png)
+![img2](https://cdn.jsdelivr.net/gh/ryry9966/meyo-assets2@main/images/2026-11-01/12748323fc078e53.png)
 
